@@ -175,17 +175,20 @@ namespace OpenRA.Mods.Common.Traits
 					return false;
 				if (world.WorldTick < 2000)
 					return false;
-				// Enemigo: primer player no-aliado y no espectador
-				var enemyPlayer = world.Players.FirstOrDefault(p => p != player && !p.NonCombatant && !p.IsAlliedWith(player));
-				if (enemyPlayer == null)
+				// Enemigos: TODOS los players enemigos (no solo el primero) — evita
+				// falso positivo si se cuela neutral/observer con 0 edificios.
+				var enemyPlayers = world.Players.Where(p => p != player && !p.NonCombatant).ToArray();
+				if (enemyPlayers.Length == 0)
 					return false;
 				// Conteo espectador exacto (sin niebla) — igual que SerializeGlobalSummary
+				// pero agregado sobre todos los enemigos (RA: 1v1, pero robusto si hay más).
 				int ownN = 0, eneN = 0;
 				int ownProd = 0, eneProd = 0;
 				int ownCash = 0, eneCash = 0;
 				int ownUnitVal = 0, eneUnitVal = 0;
 				int ownBldVal = 0, eneBldVal = 0;
-				// Guardas mínimos para no disparar al inicio (mapa aún sin produ)
+				// Set de ids enemigos para clasificación rápida de actores
+				var enemySet = new HashSet<Player>(enemyPlayers);
 				foreach (var a in world.Actors)
 				{
 					if (a.IsDead || !a.IsInWorld || a == world.WorldActor)
@@ -193,8 +196,9 @@ namespace OpenRA.Mods.Common.Traits
 					var owner = a.Owner;
 					if (owner == null || owner.NonCombatant)
 						continue;
-					var isEnemy = !owner.IsAlliedWith(player);
+					// Clasificación robusta: own si owner==player, enemy si owner en enemyPlayers
 					var isOwn = owner == player;
+					var isEnemy = enemySet.Contains(owner);
 					if (!isOwn && !isEnemy)
 						continue;
 					var valued = a.Info.TraitInfoOrDefault<ValuedInfo>();
@@ -205,9 +209,11 @@ namespace OpenRA.Mods.Common.Traits
 					{
 						if (isOwn) { ownBldVal += valued.Cost; ownN++; }
 						else { eneBldVal += valued.Cost; eneN++; }
-						// Producción: edificio con ProductionQueue
-						var pq = a.TraitOrDefault<ProductionQueue>();
-						if (pq != null)
+						// Producción: robusto — cuenta si el edificio TIENE alguna queue,
+						// aunque esté pausada/desactivada por power. Usa TraitsImplementing
+						// (no TraitOrDefault que a veces da null por inicialización).
+						var hasQueue = a.TraitsImplementing<ProductionQueue>().Any();
+						if (hasQueue)
 						{
 							if (isOwn) ownProd++;
 							else eneProd++;
@@ -220,15 +226,35 @@ namespace OpenRA.Mods.Common.Traits
 					}
 				}
 				var ownRes = player.PlayerActor.TraitOrDefault<PlayerResources>();
-				var eneRes = enemyPlayer.PlayerActor.TraitOrDefault<PlayerResources>();
 				if (ownRes != null) ownCash = ownRes.Cash;
-				if (eneRes != null) eneCash = eneRes.Cash;
+				// Cash enemigo: suma de todos los enemigos (evita elegir solo uno con 3k inicial)
+				foreach (var ep in enemyPlayers)
+				{
+					var r = ep.PlayerActor.TraitOrDefault<PlayerResources>();
+					if (r != null) eneCash += r.Cash;
+				}
 				int ownTotal = ownCash + ownUnitVal + ownBldVal;
 				int eneTotal = eneCash + eneUnitVal + eneBldVal;
-				// Guardas: no declarar si aún no tenemos economía
+				// Debug periódico (cada 1000 ticks) para cazar futuros falsos positivos sin rebuildear
+				if (world.WorldTick % 1000 == 0)
+					Log.Write("rl-bridge", $"early_check t={world.WorldTick} ownN={ownN} prod={ownProd} tot={ownTotal} | eneN={eneN} prod={eneProd} tot={eneTotal} cashO={ownCash} cashE={eneCash}");
+				// Guardas: no declarar si aún no tenemos economía NI el enemigo tiene base mínima
 				if (ownN < 3 || ownTotal < 2000)
 					return false;
-				// Condición 1: enemigo sin producción viva
+				// Requiere que el enemigo haya tenido base alguna vez — si eneN==0 pero
+				// el enemigo nunca spawneó (mapa mal) no declarar; en cambio si tenía
+				// edificios y ahora 0 sí es victoria real.
+				if (eneN == 0)
+				{
+					// Solo gana si además patrimonio colapsó (evita no_prod_0bld espurio)
+					if (eneTotal * 10 < ownTotal && eneTotal < 1000)
+					{
+						reason = $"raze_0bld_{eneTotal}vs{ownTotal}";
+						return true;
+					}
+					return false;
+				}
+				// Condición 1: enemigo sin producción viva (tiene edificios pero ninguno produce)
 				if (eneProd == 0)
 				{
 					reason = $"no_prod_{eneN}bld";
