@@ -189,6 +189,8 @@ namespace OpenRA.Mods.Common.RL {
     /// Fast-forward N ticks at CPU speed (no real-time sleeping)
     /// </summary>
     [pbr::OriginalName("FAST_ADVANCE")] FastAdvance = 21,
+    [pbr::OriginalName("PATROL")] Patrol = 22,
+    [pbr::OriginalName("ARMY_ATTACK_MOVE")] ArmyAttackMove = 23,
   }
 
   #endregion

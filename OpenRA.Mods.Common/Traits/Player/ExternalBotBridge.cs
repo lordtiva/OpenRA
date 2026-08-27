@@ -159,7 +159,91 @@ namespace OpenRA.Mods.Common.Traits
 
 		string pendingInterruptReason;
 
-		/// <summary>
+			// ── Capa 0: declaración temprana de victoria (win_early) ──────────
+			// Si n_buildings_production_enemy==0 o patrimonio_enemy <10% propio
+			// durante 500 ticks → win_early. Diferenciable de win del motor
+			// (result="win_early" vs "win") pero mismo w_win para PPO.
+			int earlyWinStreak;
+			const int EarlyWinThreshold = 500;
+			bool earlyWinDeclared;
+			internal static readonly ConcurrentDictionary<string, string> EarlyWinReasonBySession = new();
+
+			bool IsEarlyWinConditionMet(out string reason)
+			{
+				reason = null;
+				if (world == null || player == null)
+					return false;
+				if (world.WorldTick < 2000)
+					return false;
+				// Enemigo: primer player no-aliado y no espectador
+				var enemyPlayer = world.Players.FirstOrDefault(p => p != player && !p.NonCombatant && !p.IsAlliedWith(player));
+				if (enemyPlayer == null)
+					return false;
+				// Conteo espectador exacto (sin niebla) — igual que SerializeGlobalSummary
+				int ownN = 0, eneN = 0;
+				int ownProd = 0, eneProd = 0;
+				int ownCash = 0, eneCash = 0;
+				int ownUnitVal = 0, eneUnitVal = 0;
+				int ownBldVal = 0, eneBldVal = 0;
+				// Guardas mínimos para no disparar al inicio (mapa aún sin produ)
+				foreach (var a in world.Actors)
+				{
+					if (a.IsDead || !a.IsInWorld || a == world.WorldActor)
+						continue;
+					var owner = a.Owner;
+					if (owner == null || owner.NonCombatant)
+						continue;
+					var isEnemy = !owner.IsAlliedWith(player);
+					var isOwn = owner == player;
+					if (!isOwn && !isEnemy)
+						continue;
+					var valued = a.Info.TraitInfoOrDefault<ValuedInfo>();
+					if (valued == null)
+						continue;
+					bool isBuilding = a.Info.HasTraitInfo<BuildingInfo>();
+					if (isBuilding)
+					{
+						if (isOwn) { ownBldVal += valued.Cost; ownN++; }
+						else { eneBldVal += valued.Cost; eneN++; }
+						// Producción: edificio con ProductionQueue
+						var pq = a.TraitOrDefault<ProductionQueue>();
+						if (pq != null)
+						{
+							if (isOwn) ownProd++;
+							else eneProd++;
+						}
+					}
+					else
+					{
+						if (isOwn) ownUnitVal += valued.Cost;
+						else eneUnitVal += valued.Cost;
+					}
+				}
+				var ownRes = player.PlayerActor.TraitOrDefault<PlayerResources>();
+				var eneRes = enemyPlayer.PlayerActor.TraitOrDefault<PlayerResources>();
+				if (ownRes != null) ownCash = ownRes.Cash;
+				if (eneRes != null) eneCash = eneRes.Cash;
+				int ownTotal = ownCash + ownUnitVal + ownBldVal;
+				int eneTotal = eneCash + eneUnitVal + eneBldVal;
+				// Guardas: no declarar si aún no tenemos economía
+				if (ownN < 3 || ownTotal < 2000)
+					return false;
+				// Condición 1: enemigo sin producción viva
+				if (eneProd == 0)
+				{
+					reason = $"no_prod_{eneN}bld";
+					return true;
+				}
+				// Condición 2: patrimonio <10% del propio
+				if (eneTotal > 0 && ownTotal > 0 && eneTotal * 10 < ownTotal)
+				{
+					reason = $"patrimonio_{eneTotal}vs{ownTotal}";
+					return true;
+				}
+				return false;
+			}
+
+			/// <summary>
 		/// Signaled when the session is done (game over or destroyed). Used by
 		/// RLSessionManager to know when to stop the tick loop for this session.
 		/// </summary>
@@ -366,6 +450,54 @@ namespace OpenRA.Mods.Common.Traits
 						Name = "RL-Bridge-GameOver"
 					}.Start();
 				}
+			}
+			// ── Capa 0: chequeo win_early cada Tick (500 ticks sostenidos) ─
+			if (!world.IsGameOver && !earlyWinDeclared)
+			{
+				if (IsEarlyWinConditionMet(out var earlyReason))
+				{
+					earlyWinStreak++;
+					if (earlyWinStreak >= EarlyWinThreshold)
+					{
+						earlyWinDeclared = true;
+						EarlyWinReasonBySession[episodeId] = earlyReason;
+						Log.Write("rl-bridge", $"Early win declared for {episodeId}: {earlyReason} at tick {world.WorldTick} (streak {earlyWinStreak})");
+						var enemyPlayer = world.Players.FirstOrDefault(pi => pi != player && !pi.NonCombatant && !pi.IsAlliedWith(player));
+						player.WinState = WinState.Won;
+						if (enemyPlayer != null)
+							enemyPlayer.WinState = WinState.Lost;
+						world.OnPlayerWinStateChanged(player);
+						if (enemyPlayer != null)
+							world.OnPlayerWinStateChanged(enemyPlayer);
+						world.EndGame();
+						var earlyTcs = pendingAdvanceResult;
+						if (earlyTcs != null)
+						{
+							try
+							{
+								var obsEarly = observationSerializer.Serialize(world.WorldTick);
+								obsEarly.Done = true;
+								obsEarly.Result = "win_early";
+								earlyTcs.TrySetResult(obsEarly);
+							}
+							catch (Exception e)
+							{
+								earlyTcs.TrySetException(e);
+							}
+							pendingAdvanceResult = null;
+							pendingFastAdvanceTarget = 0;
+							world.SetTickScale(1.0f);
+						}
+						gameOverHandled = true;
+						if (MultiSessionMode)
+							Deactivate();
+						else
+							new Thread(() => { Thread.Sleep(3000); Game.Exit(); }) { IsBackground = true }.Start();
+						return;
+					}
+				}
+				else
+					earlyWinStreak = 0;
 			}
 
 			// Detect internal connection loss (TCP between client and embedded server)
@@ -919,8 +1051,26 @@ namespace OpenRA.Mods.Common.Traits
 					workItem.Completed.TrySetCanceled();
 				});
 
-				// Wait for the worker to finish ticking (non-blocking await)
-				await workItem.Completed.Task;
+				// Wait for the worker to finish ticking (non-blocking await) —
+				// with a timeout proportional to requested ticks (min 120s, up to 900s)
+				// to support heavy simulations with multiple concurrent sessions.
+				var fastAdvanceTimeoutMs = Math.Max(120_000, Math.Min(900_000, n * 5_000));
+				try
+				{
+					await workItem.Completed.Task.WaitAsync(TimeSpan.FromMilliseconds(
+						fastAdvanceTimeoutMs), ct);
+				}
+				catch (Exception ex) when (ex is TimeoutException
+					or OperationCanceledException)
+				{
+					// Cancel the queued work so the session doesn't stay
+					// wedged; clear the pending TCS as well.
+					workItem.Completed.TrySetCanceled();
+					tcs.TrySetCanceled();
+					throw new RpcException(new Status(StatusCode.DeadlineExceeded,
+						$"FastAdvance timeout ({fastAdvanceTimeoutMs}ms) for session "
+						+ $"{episodeId} (tick {world.WorldTick})"));
+				}
 				return await tcs.Task;
 			}
 			else

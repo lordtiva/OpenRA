@@ -104,6 +104,9 @@ namespace OpenRA.Mods.Common.Traits
 				case RLProto.ActionType.Surrender:
 					return new Order("Surrender", player.PlayerActor, false);
 
+				case RLProto.ActionType.ArmyAttackMove:
+					return CreateArmyAttackMoveOrder(cmd);
+
 				case RLProto.ActionType.FastAdvance:
 					// Handled by ExternalBotBridge directly (not an Order)
 					return null;
@@ -136,6 +139,32 @@ namespace OpenRA.Mods.Common.Traits
 			var target = Target.FromCell(world, cell);
 
 			return new Order("AttackMove", subject, target, cmd.Queued);
+		}
+
+		// Fase 2 (auditoria 2026-08-24): attack-move de TODAS las unidades de
+		// combate propias hacia la celda objetivo. Una sola decision mueve el
+		// ejercito entero: sin esto el agente no puede ejecutar una batalla
+		// con 1 comando cada 160 ticks. Los cosechadores y el MCV quedan fuera.
+		Order CreateArmyAttackMoveOrder(RLProto.Command cmd)
+		{
+			if (cmd.TargetX < 0 || cmd.TargetY < 0 ||
+				cmd.TargetX >= world.Map.MapSize.Width ||
+				cmd.TargetY >= world.Map.MapSize.Height)
+				return null;
+
+			var cell = new CPos(cmd.TargetX, cmd.TargetY);
+			var target = Target.FromCell(world, cell);
+			Order last = null;
+			foreach (var unit in world.ActorsHavingTrait<IPositionable>())
+			{
+				if (unit.Owner != player || unit.IsDead || !unit.IsInWorld)
+					continue;
+				if (unit.TraitOrDefault<Harvester>() != null)
+					continue;
+				last = new Order("AttackMove", unit, target, cmd.Queued);
+				world.IssueOrder(last);
+			}
+			return last;
 		}
 
 		Order CreateAttackOrder(RLProto.Command cmd)

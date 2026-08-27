@@ -35,7 +35,6 @@ namespace OpenRA.Mods.Common.Traits
 		static ModData modData;
 		static readonly object MapCacheLock = new();
 		static readonly object WorldCreateLock = new();
-		static readonly HashSet<string> PreparedMapUids = new();
 
 		/// <summary>Cache resolved MapPreview by map name to avoid repeated MapCache enumeration.</summary>
 		static readonly ConcurrentDictionary<string, MapPreview> ResolvedMaps = new();
@@ -239,8 +238,20 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					Log.Write("rl-bridge", $"Error disposing OrderManager for {sessionId}: {e.Message}");
 				}
+
+				// Liberar la memoria RETENIDA del proceso .NET (fix OOM).
+				// world.Dispose() marca objetos huérfanos pero NO los suelta:
+				// MapCache, secuencias y statics de ModData que cada sesión
+				// deja referenciados quedan en gen2 y el proceso sube hasta
+				// OutOfMemory sin un GC forzado (OOM observado a las ~5h con
+				// limit 6G). Forzarlo aquí compacta y devuelve memoria.
+				GC.Collect();
+				GC.WaitForPendingFinalizers();
+				GC.Collect();
 			}
 
+			// Capa 0: limpiar early-win state
+			ExternalBotBridge.EarlyWinReasonBySession.TryRemove(sessionId, out _);
 			Log.Write("rl-bridge", $"Session {sessionId} destroyed");
 		}
 
@@ -255,6 +266,17 @@ namespace OpenRA.Mods.Common.Traits
 
 			var tickCount = 0;
 			var maxTicks = 10000; // Safety limit
+
+			// Stalock guard (2026-08-25): the world tick can stall mid
+			// fast-forward (game wedged waiting on an actor/order that never
+			// completes). Each loop iteration above would just burn the tick
+			// without advancing WorldTick, never releasing the TickLock -> the
+			// whole daemon's worker pool blocks behind this one stuck session.
+			// Count consecutive iterations with NO progress and bail out so the
+			// TickLock is freed and the daemon keeps serving other sessions.
+			var lastWorldTick = 0;
+			var noProgressIterations = 0;
+			const int MaxNoProgressTicks = 200; // ~200 game ticks of stall
 
 			while (!world.IsGameOver && !bridge.SessionDone.IsSet && tickCount < maxTicks)
 			{
@@ -271,6 +293,26 @@ namespace OpenRA.Mods.Common.Traits
 					world.Tick();
 
 				tickCount++;
+
+				// If the world tick hasn't advanced, we're stalled. Escape so
+				// the worker releases the TickLock and the daemon stays alive.
+				if (world.WorldTick == lastWorldTick)
+				{
+					if (++noProgressIterations >= MaxNoProgressTicks)
+					{
+						Log.Write("rl-bridge",
+							$"TickSession: NO-PROGRESS for {noProgressIterations} "
+							+ $"iterations at tick {world.WorldTick} (session "
+							+ $"{bridge.SessionId}) — releasing worker to avoid "
+							+ $"deadlock");
+						break;
+					}
+				}
+				else
+				{
+					noProgressIterations = 0;
+					lastWorldTick = world.WorldTick;
+				}
 
 				// Once fast-forward is done, stop ticking
 				if (!orderManager.IsFastForwarding)

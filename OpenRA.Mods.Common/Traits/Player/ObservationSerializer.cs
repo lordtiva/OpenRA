@@ -64,13 +64,18 @@ namespace OpenRA.Mods.Common.Traits
 				Military = SerializeMilitary(),
 				MapInfo = SerializeMapInfo(),
 				Done = world.IsGameOver,
+				GlobalSummary = SerializeGlobalSummary(),
 			};
 
 			if (world.IsGameOver)
 			{
-				obs.Result = player.WinState == WinState.Won ? "win"
-					: player.WinState == WinState.Lost ? "lose"
-					: "draw";
+				// Capa 0: win_early vs win del motor — diferenciable pero mismo w_win
+				if (ExternalBotBridge.EarlyWinReasonBySession.ContainsKey(episodeId))
+					obs.Result = player.WinState == WinState.Won ? "win_early" : "lose";
+				else
+					obs.Result = player.WinState == WinState.Won ? "win"
+						: player.WinState == WinState.Lost ? "lose"
+						: "draw";
 			}
 
 			SerializeOwnedActors(obs);
@@ -147,6 +152,62 @@ namespace OpenRA.Mods.Common.Traits
 			military.ActiveUnitCount = unitCount;
 
 			return military;
+		}
+
+		// Resumen modo ESPECTADOR por bando (evaluación): totales exactos
+		// sin niebla — cash + valor de unidades + edificios de NOSOTROS y del
+		// enemigo. NO debe usarse para decidir: el agente sigue con su obs
+		// con niebla; esto alimenta economy_race/supremacy de métricas.
+		RLProto.RlGlobalSummary SerializeGlobalSummary()
+		{
+			var summary = new RLProto.RlGlobalSummary
+			{
+				Own = new RLProto.RlGlobalSummary.Types.Side(),
+				Enemy = new RLProto.RlGlobalSummary.Types.Side(),
+			};
+
+			foreach (var actor in world.Actors)
+			{
+				if (actor.IsDead || !actor.IsInWorld || actor == world.WorldActor)
+					continue;
+				var owner = actor.Owner;
+				if (owner == null || owner.NonCombatant || owner.WinState == WinState.Lost)
+					continue;
+
+				var isEnemy = !owner.IsAlliedWith(player);
+				var side = isEnemy ? summary.Enemy : summary.Own;
+				if (!isEnemy && owner != player)
+					continue; // aliado pero no nosotros: excluir para 'own' estricto
+
+				var valued = actor.Info.TraitInfoOrDefault<ValuedInfo>();
+				if (valued == null)
+					continue;
+
+				if (actor.Info.HasTraitInfo<BuildingInfo>())
+				{
+					side.BuildingValue += valued.Cost;
+					side.NBuildings++;
+				}
+				else
+					side.UnitValue += valued.Cost;
+			}
+
+			var ownRes = player.PlayerActor.TraitOrDefault<PlayerResources>();
+			if (ownRes != null)
+			{
+				summary.Own.Cash = ownRes.Cash;
+				summary.Own.Earned = ownRes.Earned;
+			}
+
+			var enemyPlayer = world.Players.FirstOrDefault(p => p != player && !p.NonCombatant);
+			var eneRes = enemyPlayer?.PlayerActor.TraitOrDefault<PlayerResources>();
+			if (eneRes != null)
+			{
+				summary.Enemy.Cash = eneRes.Cash;
+				summary.Enemy.Earned = eneRes.Earned;
+			}
+
+			return summary;
 		}
 
 		void SerializeOwnedActors(RLProto.GameObservation obs)

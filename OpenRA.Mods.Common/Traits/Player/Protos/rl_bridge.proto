@@ -61,9 +61,25 @@ message GameObservation {
 
   // Server-side interrupt detection results
   bool interrupted = 18;           // true if advance ended early due to interrupt
-  string interrupt_reason = 19;    // signal name (e.g. "enemy_spotted")
-  int32 actual_ticks_advanced = 20; // ticks actually advanced (may be < requested)
-}
+    string interrupt_reason = 19;    // signal name (e.g. "enemy_spotted")
+    int32 actual_ticks_advanced = 20; // ticks actually advanced (may be < requested)
+
+    // Resumen modo espectador por bando (evaluacion / metricas). NO debe
+    // usarse para decidir: el agente sigue con su obs con niebla.
+    RlGlobalSummary global_summary = 21;
+  }
+
+  message RlGlobalSummary {
+        message Side {
+          int32 cash = 1;
+          int32 unit_value = 2;
+          int32 building_value = 3;
+          int32 n_buildings = 4;   // conteo de edificios vivos del bando (para raze)
+          int32 earned = 5;        // mineral extraido acumulado (PlayerResources.Earned)
+        }
+        Side own = 1;
+        Side enemy = 2;
+      }
 
 message RlEconomy {
   int32 cash = 1;
@@ -189,7 +205,9 @@ enum ActionType {
   POWER_DOWN = 18;      // Toggle building power on/off (actor_id = building)
   SET_PRIMARY = 19;     // Set primary production building (actor_id = building)
   SURRENDER = 20;       // Surrender / resign — ends the game as a loss
-  FAST_ADVANCE = 21;    // Fast-forward N ticks at CPU speed (no real-time sleeping)
+  FAST_ADVANCE = 21;
+  PATROL = 22;          // Patrol between current position and target
+  ARMY_ATTACK_MOVE = 23;
 }
 
 // ─── State Query ─────────────────────────────────────────────────────────────

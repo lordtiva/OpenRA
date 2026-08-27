@@ -164,14 +164,32 @@ namespace OpenRA.Mods.Common.Traits
 		void CheckIfGameIsOver(Player player)
 		{
 			var gameOver = player.World.Players.All(p => p.NonCombatant || p.WinState != WinState.Undefined || !p.HasObjectives);
-			if (gameOver)
+			if (!gameOver)
+				return;
+
+			// Multi-sesión RL: dos razones para terminar SIN delay y sin
+			// guards (bug raíz hallado con sondas 2026-08-25: ninguna partida
+			// declaraba win/lose, ni siquiera tras Surrender):
+			//   1. CreateSession pisa Game.OrderManager continuamente -> el
+			//      guard IsCurrentWorld descartaba el EndGame de las demás
+			//      sesiones casi siempre.
+			//   2. Game.RunAfterDelay depende del tick del loop principal,
+			//      que en multi-sesión no avanza (TickSession tickea cada
+			//      mundo manualmente) -> el callback quedaba CONGELADO para
+			//      siempre. Sin loop principal no hay reloj: endgame directo.
+			// Los mundos multi-sesión son headless: el delay de notificación
+			// es irrelevante ahí.
+			if (ExternalBotBridge.MultiSessionMode)
 			{
-				Game.RunAfterDelay(Info.GameOverDelay, () =>
-				{
-					if (Game.IsCurrentWorld(player.World))
-						player.World.EndGame();
-				});
+				player.World.EndGame();
+				return;
 			}
+
+			Game.RunAfterDelay(Info.GameOverDelay, () =>
+			{
+				if (Game.IsCurrentWorld(player.World))
+					player.World.EndGame();
+			});
 		}
 
 		void INotifyWinStateChanged.OnPlayerWon(Player player)
