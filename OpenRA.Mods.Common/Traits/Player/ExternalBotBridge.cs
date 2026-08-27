@@ -237,10 +237,15 @@ namespace OpenRA.Mods.Common.Traits
 				int eneTotal = eneCash + eneUnitVal + eneBldVal;
 				// Debug periódico (cada 1000 ticks) para cazar futuros falsos positivos sin rebuildear
 				if (world.WorldTick % 1000 == 0)
-					Log.Write("rl-bridge", $"early_check t={world.WorldTick} ownN={ownN} prod={ownProd} tot={ownTotal} | eneN={eneN} prod={eneProd} tot={eneTotal} cashO={ownCash} cashE={eneCash}");
+				{
+					var ownBldNames = string.Join(",", world.Actors.Where(a => !a.IsDead && a.IsInWorld && a.Owner == player && a.Info.HasTraitInfo<BuildingInfo>()).Take(8).Select(a => a.Info.Name));
+					Log.Write("rl-bridge", $"early_check t={world.WorldTick} ownN={ownN} prod={ownProd} tot={ownTotal} | eneN={eneN} prod={eneProd} tot={eneTotal} cashO={ownCash} cashE={eneCash} bldOwn=[{ownBldNames}]");
+				}
 				// Guardas: no declarar si aún no tenemos economía NI el enemigo tiene base mínima
 				if (ownN < 3 || ownTotal < 2000)
 					return false;
+				if (ownProd == 0)
+					return false; // no declarar si ni siquiera nosotros producimos (falso positivo simétrico)
 				// Requiere que el enemigo haya tenido base alguna vez — si eneN==0 pero
 				// el enemigo nunca spawneó (mapa mal) no declarar; en cambio si tenía
 				// edificios y ahora 0 sí es victoria real.
@@ -254,12 +259,14 @@ namespace OpenRA.Mods.Common.Traits
 					}
 					return false;
 				}
-				// Condición 1: enemigo sin producción viva (tiene edificios pero ninguno produce)
-				if (eneProd == 0)
-				{
-					reason = $"no_prod_{eneN}bld";
-					return true;
-				}
+				// Condición 1: enemigo sin producción viva — DESACTIVADA (falso positivo: prod==0 para ambos lados en 2000)
+				// El conteo TraitsImplementing<ProductionQueue> daba 0 incluso con ConYard vivo.
+				// Hasta tener detection robusta (Production trait), solo gana por raze o patrimonio.
+				//if (eneProd == 0)
+				//{
+				//	reason = $"no_prod_{eneN}bld";
+				//	return true;
+				//}
 				// Condición 2: patrimonio <10% del propio
 				if (eneTotal > 0 && ownTotal > 0 && eneTotal * 10 < ownTotal)
 				{
