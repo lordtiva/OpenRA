@@ -36,6 +36,13 @@ namespace OpenRA.Mods.Common.Traits
 		static readonly object MapCacheLock = new();
 		static readonly object WorldCreateLock = new();
 
+		/// <summary>
+		/// Session IDs whose client already called DestroySession while
+		/// InitSession was still running. Prevents a late register from
+		/// leaking a world that holds WorldCreateLock's aftermath.
+		/// </summary>
+		static readonly ConcurrentDictionary<string, byte> CancelledSessions = new();
+
 		/// <summary>Cache resolved MapPreview by map name to avoid repeated MapCache enumeration.</summary>
 		static readonly ConcurrentDictionary<string, MapPreview> ResolvedMaps = new();
 
@@ -122,10 +129,20 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					// Per-session lock: prevents two concurrent FastAdvance calls
 					// from ticking the same World simultaneously.
-					state.TickLock.Wait();
+					if (!state.TickLock.Wait(TimeSpan.FromSeconds(20)))
+					{
+						Log.Write("rl-bridge",
+							$"TickLock timeout 20s session {item.Bridge.SessionId}");
+						item.Bridge.FailPendingAdvance("TickLock timeout 20s");
+						item.Completed.TrySetException(
+							new TimeoutException("TickLock timeout 20s"));
+						continue;
+					}
+
 					try
 					{
 						TickSession(state, item.Bridge);
+						item.Bridge.CompletePendingAdvance("worker-done");
 					}
 					finally
 					{
@@ -208,6 +225,8 @@ namespace OpenRA.Mods.Common.Traits
 		/// </summary>
 		public static void DestroySession(string sessionId)
 		{
+			CancelledSessions[sessionId] = 0;
+
 			if (ExternalBotBridge.Sessions.TryGetValue(sessionId, out var bridge))
 				bridge.Deactivate();
 
@@ -314,13 +333,19 @@ namespace OpenRA.Mods.Common.Traits
 					lastWorldTick = world.WorldTick;
 				}
 
-				// Once fast-forward is done, stop ticking
-				if (!orderManager.IsFastForwarding)
+				// Don't stop while the unary TCS is still pending: a paused
+				// first TryTick or game-over-before-ITick used to drop it.
+				if (!orderManager.IsFastForwarding && !bridge.HasPendingAdvance)
 					break;
 			}
 
 			if (tickCount >= maxTicks)
 				Log.Write("rl-bridge", $"TickSession: safety limit reached after {maxTicks} ticks!");
+
+			bridge.CompletePendingAdvance(
+				world.IsGameOver ? "game-over" :
+				tickCount >= maxTicks ? "max-ticks" :
+				"ticksession-exit");
 		}
 
 		/// <summary>
@@ -395,9 +420,20 @@ namespace OpenRA.Mods.Common.Traits
 			// 3. PrepareMap — must run for every map (sprite sequences are map-specific,
 			//    and randomized scenarios produce unique map UIDs every time).
 			//    Serialized because it mutates global statics (ChromeMetrics, ChromeProvider, Sound).
-			lock (WorldCreateLock)
+			if (!Monitor.TryEnter(WorldCreateLock, TimeSpan.FromSeconds(20)))
 			{
+				Log.Write("rl-bridge", $"Session {sessionId}: WorldCreateLock timeout on PrepareMap");
+				return;
+			}
+			try
+			{
+				if (CancelledSessions.ContainsKey(sessionId))
+					return;
 				modData.PrepareMap(map);
+			}
+			finally
+			{
+				Monitor.Exit(WorldCreateLock);
 			}
 
 			// 4. Create isolated OrderManager with EchoConnection (no network)
@@ -412,8 +448,19 @@ namespace OpenRA.Mods.Common.Traits
 			//    With PrepareMap cached and map lookup cached, the lock only covers
 			//    World construction (~300ms per session). 64 sessions ≈ 19s total.
 			Log.Write("rl-bridge", $"Session {sessionId}: Creating world");
-			lock (WorldCreateLock)
+			if (!Monitor.TryEnter(WorldCreateLock, TimeSpan.FromSeconds(20)))
 			{
+				Log.Write("rl-bridge", $"Session {sessionId}: WorldCreateLock timeout on World ctor");
+				try { orderManager.Dispose(); } catch { }
+				return;
+			}
+			try
+			{
+				if (CancelledSessions.ContainsKey(sessionId))
+				{
+					try { orderManager.Dispose(); } catch { }
+					return;
+				}
 				Game.OrderManager = orderManager;
 				ExternalBotBridge.NextSessionId = sessionId;
 				orderManager.World = new World(map, modData, orderManager, WorldType.Regular);
@@ -421,8 +468,21 @@ namespace OpenRA.Mods.Common.Traits
 				orderManager.World.LoadComplete(null);
 				orderManager.StartGame();
 			}
+			finally
+			{
+				Monitor.Exit(WorldCreateLock);
+			}
 
 			var world = orderManager.World;
+
+			// Client already DestroySession'd us while we were inside the lock.
+			if (CancelledSessions.TryRemove(sessionId, out _))
+			{
+				Log.Write("rl-bridge", $"Session {sessionId}: cancelled during init, disposing world");
+				try { world.Dispose(); } catch { }
+				try { orderManager.Dispose(); } catch { }
+				return;
+			}
 
 			// 7. Register session state IMMEDIATELY after world is ready, BEFORE
 			// the bridge becomes visible to gRPC. This prevents a race where

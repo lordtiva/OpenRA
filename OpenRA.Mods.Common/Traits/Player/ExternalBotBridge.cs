@@ -424,6 +424,54 @@ namespace OpenRA.Mods.Common.Traits
 			Log.Write("rl-bridge", $"Session {episodeId} deactivated");
 		}
 
+		internal bool HasPendingAdvance => pendingAdvanceResult != null;
+
+		/// <summary>
+		/// TickSession / worker must never finish while FastAdvance is still
+		/// waiting: a paused first TryTick or game-over-before-ITick used to
+		/// leave the unary RPC hung until the Python 110s deadline.
+		/// No-op if ITick already completed the TCS.
+		/// </summary>
+		internal void CompletePendingAdvance(string reason)
+		{
+			var tcs = pendingAdvanceResult;
+			if (tcs == null)
+				return;
+			pendingAdvanceResult = null;
+			pendingFastAdvanceTarget = 0;
+			try { world.SetTickScale(1.0f); } catch { /* world may be disposing */ }
+			try
+			{
+				var obs = observationSerializer.Serialize(world.WorldTick);
+				if (world.IsGameOver)
+				{
+					obs.Done = true;
+					obs.Result = player != null && player.WinState == WinState.Won ? "win" : "lose";
+				}
+
+				Log.Write("rl-bridge",
+					$"CompletePendingAdvance ({reason}) tick={world.WorldTick} session={episodeId}");
+				tcs.TrySetResult(obs);
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"CompletePendingAdvance failed ({reason}): {e.Message}");
+				tcs.TrySetException(e);
+			}
+		}
+
+		internal void FailPendingAdvance(string reason)
+		{
+			var tcs = pendingAdvanceResult;
+			if (tcs == null)
+				return;
+			pendingAdvanceResult = null;
+			pendingFastAdvanceTarget = 0;
+			try { world.SetTickScale(1.0f); } catch { }
+			Log.Write("rl-bridge", $"FailPendingAdvance ({reason}) session={episodeId}");
+			tcs.TrySetException(new RpcException(new Status(StatusCode.Unavailable, reason)));
+		}
+
 		void IBot.QueueOrder(Order order)
 		{
 			orders.Enqueue(order);
@@ -1100,6 +1148,7 @@ namespace OpenRA.Mods.Common.Traits
 					// wedged; clear the pending TCS as well.
 					workItem.Completed.TrySetCanceled();
 					tcs.TrySetCanceled();
+					SessionDone.Set();
 					throw new RpcException(new Status(StatusCode.DeadlineExceeded,
 						$"FastAdvance timeout ({fastAdvanceTimeoutMs}ms) for session "
 						+ $"{episodeId} (tick {world.WorldTick})"));
