@@ -65,6 +65,11 @@ namespace OpenRA.Mods.Common.Widgets.Logic
 			{
 				foreach (var b in map.PlayerActorInfo.TraitInfos<IBotInfo>())
 				{
+					// dummy is a training-only occupant (Launch.Bots). Keep it out of
+					// the skirmish dropdown so PPO Agent sits with beginner/easy/hard.
+					if (b.Type == "dummy")
+						continue;
+
 					var botController = orderManager.LobbyInfo.Clients.FirstOrDefault(c => c.IsAdmin);
 					bots.Add(new SlotDropDownOption(map.GetMessage(b.Name),
 						$"slot_bot {slot.PlayerReference} {botController.Index} {b.Type}",

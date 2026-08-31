@@ -956,7 +956,7 @@ bot-medium-ai =
 
 ## rl-bot.yaml
 bot-rl-agent =
-    .name = RL Agent
+    .name = PPO Agent
 
 ## map-generators.yaml
 label-random-map = Random Map

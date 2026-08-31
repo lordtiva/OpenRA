@@ -390,6 +390,7 @@ namespace OpenRA
 			Log.AddChannel("nat", "nat.log");
 			Log.AddChannel("client", "client.log");
 			Log.AddChannel("rl-bridge", "rl-bridge.log");
+			Log.AddChannel("ppo-agent", "ppo-agent.log");
 
 			Nat.Initialize();
 

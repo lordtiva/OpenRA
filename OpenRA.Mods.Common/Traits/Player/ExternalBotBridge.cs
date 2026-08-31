@@ -12,6 +12,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
@@ -78,6 +80,14 @@ namespace OpenRA.Mods.Common.Traits
 
 		static WebApplication grpcApp;
 		static bool grpcServerStarted;
+		static readonly ManualResetEventSlim GrpcListen = new(false);
+		static volatile bool grpcListenOk;
+
+		/// <summary>
+		/// GUI skirmish must not share docker compose's host :9999 (train).
+		/// Headless / MultiSession keep yaml Port (9999).
+		/// </summary>
+		const int GuiGrpcPort = 10001;
 		static readonly object GrpcLock = new();
 
 		public volatile bool IsEnabled;
@@ -123,6 +133,13 @@ namespace OpenRA.Mods.Common.Traits
 		// Unary FastAdvance: TaskCompletionSource completed when target tick is reached.
 		// Must be set BEFORE pendingFastAdvanceTarget (volatile write provides release fence).
 		volatile TaskCompletionSource<RLProto.GameObservation> pendingAdvanceResult;
+
+		// FastAdvance(ticks <= 0): inject commands on the game thread and return
+		// the current observation without changing tickScale. Used for GUI skirmish
+		// vs a human (the world already ticks at 25 tps).
+		volatile bool pendingRealtimeSnapshot;
+
+		Process ppoSidecar;
 
 		// Server-side interrupt detection state
 		volatile int interruptCheckInterval;  // check every N ticks (0 = disabled)
@@ -348,6 +365,11 @@ namespace OpenRA.Mods.Common.Traits
 				grpcApp.MapGrpcService<RLBridgeService>();
 
 				Log.Write("rl-bridge", $"gRPC server starting on port {port}");
+				grpcApp.Lifetime.ApplicationStarted.Register(() =>
+				{
+					grpcListenOk = true;
+					GrpcListen.Set();
+				});
 				grpcApp.Run();
 			}
 			catch (Exception e)
@@ -357,6 +379,9 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					grpcServerStarted = false;
 				}
+
+				grpcListenOk = false;
+				GrpcListen.Set();
 			}
 		}
 
@@ -398,6 +423,15 @@ namespace OpenRA.Mods.Common.Traits
 				var envPort = Environment.GetEnvironmentVariable("RL_GRPC_PORT");
 				if (!string.IsNullOrEmpty(envPort) && int.TryParse(envPort, out var pp))
 					port = pp;
+				else if (!Game.IsHeadless)
+					port = GuiGrpcPort;
+
+				var alreadyListening = grpcServerStarted && grpcListenOk;
+				if (!Game.IsHeadless && !alreadyListening)
+				{
+					GrpcListen.Reset();
+					grpcListenOk = false;
+				}
 
 				var thread = new Thread(() => StartGrpcServer(port))
 				{
@@ -405,6 +439,38 @@ namespace OpenRA.Mods.Common.Traits
 					Name = "RL-Bridge-gRPC"
 				};
 				thread.Start();
+
+				// GUI skirmish: spawn the Python PPO sidecar so picking
+				// "PPO Agent" in the lobby is enough. Headless train does not.
+				if (!Game.IsHeadless)
+				{
+					var listenOk = alreadyListening
+						|| (GrpcListen.Wait(5000) && grpcListenOk);
+					if (!listenOk)
+					{
+						Log.Write("rl-bridge",
+							$"gRPC :{port} did not listen — not starting sidecar. " +
+							"Is docker/train using this port? GUI default is 10001.");
+					}
+					else
+						TryStartPpoSidecar(port);
+
+					var captured = this;
+					new Thread(() =>
+					{
+						Thread.Sleep(30000);
+						if (!captured.agentConnected && captured.IsEnabled)
+						{
+							Log.Write("rl-bridge", "PPO sidecar did not connect in 30s — unpausing so the human is not stuck");
+							try { world.SetLocalPauseState(false); }
+							catch (Exception e) { Log.Write("rl-bridge", $"unpause timeout: {e.Message}"); }
+						}
+					})
+					{
+						IsBackground = true,
+						Name = "RL-Bridge-UnpauseTimeout"
+					}.Start();
+				}
 			}
 		}
 
@@ -420,6 +486,8 @@ namespace OpenRA.Mods.Common.Traits
 
 			// Complete any pending FastAdvance so the gRPC call doesn't hang forever
 			pendingAdvanceResult?.TrySetCanceled();
+			pendingRealtimeSnapshot = false;
+			TryStopPpoSidecar();
 
 			Log.Write("rl-bridge", $"Session {episodeId} deactivated");
 		}
@@ -439,6 +507,7 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			pendingAdvanceResult = null;
 			pendingFastAdvanceTarget = 0;
+			pendingRealtimeSnapshot = false;
 			try { world.SetTickScale(1.0f); } catch { /* world may be disposing */ }
 			try
 			{
@@ -467,6 +536,7 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			pendingAdvanceResult = null;
 			pendingFastAdvanceTarget = 0;
+			pendingRealtimeSnapshot = false;
 			try { world.SetTickScale(1.0f); } catch { }
 			Log.Write("rl-bridge", $"FailPendingAdvance ({reason}) session={episodeId}");
 			tcs.TrySetException(new RpcException(new Status(StatusCode.Unavailable, reason)));
@@ -519,21 +589,12 @@ namespace OpenRA.Mods.Common.Traits
 				}
 				else
 				{
-					// Legacy single-session mode: exit the whole process
-					new Thread(() =>
-					{
-						Thread.Sleep(3000);
-						Log.Write("rl-bridge", "Exiting game process to finalize replay");
-						Game.Exit();
-					})
-					{
-						IsBackground = true,
-						Name = "RL-Bridge-GameOver"
-					}.Start();
+					ScheduleProcessExit("game over", 3000);
 				}
 			}
 			// ── Capa 0: chequeo win_early cada Tick (500 ticks sostenidos) ─
-			if (!world.IsGameOver && !earlyWinDeclared)
+			// GUI skirmish vs a human: never steal the match with a patrimonio rule.
+			if (!world.IsGameOver && !earlyWinDeclared && Game.IsHeadless)
 			{
 				if (IsEarlyWinConditionMet(out var earlyReason))
 				{
@@ -573,7 +634,7 @@ namespace OpenRA.Mods.Common.Traits
 						if (MultiSessionMode)
 							Deactivate();
 						else
-							new Thread(() => { Thread.Sleep(3000); Game.Exit(); }) { IsBackground = true }.Start();
+							ScheduleProcessExit("win_early", 3000);
 						return;
 					}
 				}
@@ -603,16 +664,7 @@ namespace OpenRA.Mods.Common.Traits
 				}
 				else
 				{
-					new Thread(() =>
-					{
-						Thread.Sleep(500);
-						Log.Write("rl-bridge", "Exiting game process due to connection loss");
-						Game.Exit();
-					})
-					{
-						IsBackground = true,
-						Name = "RL-Bridge-ConnLost"
-					}.Start();
+					ScheduleProcessExit("connection lost", 500);
 				}
 
 				return;
@@ -720,6 +772,34 @@ namespace OpenRA.Mods.Common.Traits
 			while (orders.Count > 0)
 				world.IssueOrder(orders.Dequeue());
 
+			// Realtime snapshot (FastAdvance ticks<=0): serialize on this thread
+			// after orders are issued, without changing tickScale.
+			if (pendingRealtimeSnapshot)
+			{
+				pendingRealtimeSnapshot = false;
+				var rtTcs = pendingAdvanceResult;
+				pendingAdvanceResult = null;
+				if (rtTcs != null)
+				{
+					try
+					{
+						var obs = observationSerializer.Serialize(world.WorldTick);
+						if (world.IsGameOver)
+						{
+							obs.Done = true;
+							obs.Result = player != null && player.WinState == WinState.Won ? "win" : "lose";
+						}
+
+						rtTcs.TrySetResult(obs);
+					}
+					catch (Exception e)
+					{
+						Log.Write("rl-bridge", $"Realtime snapshot failed: {e.Message}");
+						rtTcs.TrySetException(e);
+					}
+				}
+			}
+
 			// Only send observations at the configured interval
 			if (world.WorldTick % info.ObservationInterval != 0)
 				return;
@@ -774,16 +854,7 @@ namespace OpenRA.Mods.Common.Traits
 			else
 			{
 				Log.Write("rl-bridge", "RL agent disconnected, scheduling graceful exit");
-				new Thread(() =>
-				{
-					Thread.Sleep(2000);
-					Log.Write("rl-bridge", "Exiting game process to finalize replay");
-					Game.Exit();
-				})
-				{
-					IsBackground = true,
-					Name = "RL-Bridge-Exit"
-				}.Start();
+				ScheduleProcessExit("agent disconnected", 2000);
 			}
 		}
 
@@ -1060,6 +1131,11 @@ namespace OpenRA.Mods.Common.Traits
 				throw new RpcException(new Status(StatusCode.Aborted,
 					$"Session {episodeId} is no longer active"));
 
+			// ticks <= 0: GUI skirmish. Inject commands, return current obs,
+			// do NOT set tickScale (the human is playing in real time).
+			if (ticks <= 0)
+				return await RequestRealtimeSnapshot(commands, ct);
+
 			// Connect agent if this is the first call (unpauses game)
 			if (!agentConnected)
 				OnAgentConnected();
@@ -1163,6 +1239,186 @@ namespace OpenRA.Mods.Common.Traits
 				using var reg = ct.Register(() => tcs.TrySetCanceled());
 				return await tcs.Task;
 			}
+		}
+
+		/// <summary>
+		/// Inject optional commands on the game thread and return the current
+		/// observation without fast-forwarding. First call unpauses the match.
+		/// </summary>
+		async Task<RLProto.GameObservation> RequestRealtimeSnapshot(
+			IEnumerable<RLProto.Command> commands, CancellationToken ct)
+		{
+			if (!agentConnected)
+				OnAgentConnected();
+
+			var tcs = new TaskCompletionSource<RLProto.GameObservation>(
+				TaskCreationOptions.RunContinuationsAsynchronously);
+			pendingAdvanceResult = tcs;
+			pendingRealtimeSnapshot = true;
+
+			var cmds = commands != null ? commands.ToList() : new List<RLProto.Command>();
+			if (cmds.Count > 0)
+			{
+				var action = new RLProto.AgentAction();
+				action.Commands.Add(cmds);
+				actionChannel.Writer.TryWrite(action);
+			}
+
+			TickRequested.Set();
+			using var reg = ct.Register(() => tcs.TrySetCanceled());
+			return await tcs.Task;
+		}
+
+		/// <summary>
+		/// Headless train: kill the process so replays flush. GUI skirmish: keep
+		/// the window open for the victory/defeat screen.
+		/// </summary>
+		void ScheduleProcessExit(string reason, int delayMs)
+		{
+			TryStopPpoSidecar();
+			if (!Game.IsHeadless)
+			{
+				Log.Write("rl-bridge", $"{reason} (GUI: keeping process alive)");
+				return;
+			}
+
+			new Thread(() =>
+			{
+				Thread.Sleep(Math.Max(0, delayMs));
+				Log.Write("rl-bridge", $"Exiting game process ({reason})");
+				Game.Exit();
+			})
+			{
+				IsBackground = true,
+				Name = "RL-Bridge-Exit"
+			}.Start();
+		}
+
+		void TryStartPpoSidecar(int port)
+		{
+			var disable = Environment.GetEnvironmentVariable("OPENRA_RL_AUTOSTART");
+			if (disable == "0" || string.Equals(disable, "false", StringComparison.OrdinalIgnoreCase))
+			{
+				Log.Write("rl-bridge", "PPO sidecar: OPENRA_RL_AUTOSTART=0 (external attach)");
+				return;
+			}
+
+			var repo = FindRlRepo();
+			if (repo == null)
+			{
+				Log.Write("rl-bridge", "PPO sidecar: repo not found (set OPENRA_RL_ROOT to OpenRA-RL)");
+				return;
+			}
+
+			var python = Environment.GetEnvironmentVariable("OPENRA_RL_PYTHON");
+			if (string.IsNullOrEmpty(python))
+			{
+				var win = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+				var nix = Path.Combine(repo, ".venv", "bin", "python");
+				python = File.Exists(win) ? win : File.Exists(nix) ? nix : null;
+			}
+
+			if (string.IsNullOrEmpty(python) || !File.Exists(python))
+			{
+				Log.Write("rl-bridge", "PPO sidecar: python not found (set OPENRA_RL_PYTHON)");
+				return;
+			}
+
+			var ckpt = Environment.GetEnvironmentVariable("OPENRA_RL_CKPT");
+			if (string.IsNullOrEmpty(ckpt))
+			{
+				var best = Path.Combine(repo, "rl", "ckpts", "best.pt");
+				var latest = Path.Combine(repo, "rl", "ckpts", "latest.pt");
+				ckpt = File.Exists(best) ? best : latest;
+			}
+
+			if (string.IsNullOrEmpty(ckpt) || !File.Exists(ckpt))
+			{
+				Log.Write("rl-bridge", $"PPO sidecar: checkpoint missing ({ckpt})");
+				return;
+			}
+
+			try
+			{
+				// OpenRA.Log.Write throws on the logging thread if the channel
+				// was never AddChannel'd (kills the whole process). Register
+				// here too in case this binary is mixed with an older Game.dll.
+				Log.AddChannel("ppo-agent", "ppo-agent.log");
+
+				var psi = new ProcessStartInfo
+				{
+					FileName = python,
+					Arguments = $"-m rl.play_skirmish --attach --port {port} --ckpt \"{ckpt}\"",
+					WorkingDirectory = repo,
+					UseShellExecute = false,
+					CreateNoWindow = true,
+					RedirectStandardOutput = true,
+					RedirectStandardError = true
+				};
+				psi.Environment["PYTHONPATH"] = repo;
+				psi.Environment["PYTHONUNBUFFERED"] = "1";
+				psi.Environment["OPENRA_RL_AUTOSTART"] = "0";
+
+				ppoSidecar = Process.Start(psi);
+				if (ppoSidecar == null)
+				{
+					Log.Write("rl-bridge", "PPO sidecar: Process.Start returned null");
+					return;
+				}
+
+				ppoSidecar.OutputDataReceived += (_, e) =>
+				{
+					if (!string.IsNullOrEmpty(e.Data))
+						Log.Write("ppo-agent", e.Data);
+				};
+				ppoSidecar.ErrorDataReceived += (_, e) =>
+				{
+					if (!string.IsNullOrEmpty(e.Data))
+						Log.Write("ppo-agent", e.Data);
+				};
+				ppoSidecar.BeginOutputReadLine();
+				ppoSidecar.BeginErrorReadLine();
+				Log.Write("rl-bridge", $"PPO sidecar pid={ppoSidecar.Id} ckpt={ckpt}");
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"PPO sidecar failed to start: {e}");
+			}
+		}
+
+		void TryStopPpoSidecar()
+		{
+			var proc = ppoSidecar;
+			ppoSidecar = null;
+			if (proc == null || proc.HasExited)
+				return;
+
+			try
+			{
+				proc.Kill(entireProcessTree: true);
+				Log.Write("rl-bridge", $"PPO sidecar killed pid={proc.Id}");
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"PPO sidecar kill: {e.Message}");
+			}
+		}
+
+		static string FindRlRepo()
+		{
+			var env = Environment.GetEnvironmentVariable("OPENRA_RL_ROOT");
+			if (!string.IsNullOrEmpty(env) && File.Exists(Path.Combine(env, "rl", "play_skirmish.py")))
+				return Path.GetFullPath(env);
+
+			var engine = Platform.EngineDir;
+			foreach (var cand in new[] { Path.Combine(engine, ".."), engine })
+			{
+				var full = Path.GetFullPath(cand);
+				if (File.Exists(Path.Combine(full, "rl", "play_skirmish.py")))
+					return full;
+			}
+
+			return null;
 		}
 
 		/// <summary>
