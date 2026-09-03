@@ -10,6 +10,7 @@
 #endregion
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
@@ -145,10 +146,14 @@ namespace OpenRA.Mods.Common.Traits
 					throw new RpcException(new Status(StatusCode.Unavailable,
 						$"Bridge not activated within 300s (session_id={request.SessionId})"));
 
+				IEnumerable<RLProto.Command> peerCmds = null;
+				if (request.PeerCommands != null && request.PeerCommands.Count > 0)
+					peerCmds = request.PeerCommands;
 				return await bridge.RequestFastAdvance(
 					request.Ticks, request.Commands, context.CancellationToken,
 					request.CheckEventsEvery,
-					request.EnabledInterrupts.Count > 0 ? request.EnabledInterrupts : null);
+					request.EnabledInterrupts.Count > 0 ? request.EnabledInterrupts : null,
+					peerCmds, request.PeerSlot);
 			}
 			catch (RpcException)
 			{
@@ -158,6 +163,29 @@ namespace OpenRA.Mods.Common.Traits
 			{
 				Log.Write("rl-bridge", $"FastAdvance error for session {request.SessionId}: {e}");
 				throw;
+			}
+		}
+
+		/// <summary>
+		/// Unary RPC: observation snapshot for a player slot (RL-vs-RL peer after FastAdvance).
+		/// </summary>
+		public override Task<RLProto.GameObservation> GetObservation(
+			RLProto.ObservationRequest request,
+			ServerCallContext context)
+		{
+			var bridge = ExternalBotBridge.LookupPlayerSession(request.SessionId, request.PlayerSlot);
+			if (bridge == null || !bridge.IsEnabled)
+				throw new RpcException(new Status(StatusCode.NotFound,
+					$"No bridge for session={request.SessionId} slot={request.PlayerSlot}"));
+
+			try
+			{
+				return Task.FromResult(bridge.SerializeObservationNow());
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"GetObservation error: {e}");
+				throw new RpcException(new Status(StatusCode.Internal, e.Message));
 			}
 		}
 

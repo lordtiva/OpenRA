@@ -209,6 +209,14 @@ namespace OpenRA.Mods.Common.Traits
 
 					if (ExternalBotBridge.Sessions.TryRemove(sessionId, out var crashed))
 						crashed.Deactivate();
+					var peerKeys = new System.Collections.Generic.List<string>();
+					foreach (var kvp in ExternalBotBridge.PlayerSessions)
+					{
+						if (kvp.Key.StartsWith(sessionId + "|", StringComparison.Ordinal))
+							peerKeys.Add(kvp.Key);
+					}
+					foreach (var key in peerKeys)
+						ExternalBotBridge.PlayerSessions.TryRemove(key, out _);
 				}
 			})
 			{

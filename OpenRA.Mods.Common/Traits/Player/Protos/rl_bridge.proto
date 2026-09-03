@@ -19,6 +19,10 @@ service RLBridge {
   // Bypasses streaming — works reliably on all platforms.
   rpc FastAdvance(FastAdvanceRequest) returns (GameObservation);
 
+  // Unary: snapshot observation for a specific player slot (RL-vs-RL peer).
+  // Call after FastAdvance; world must be idle. Empty player_slot = primary (Multi1).
+  rpc GetObservation(ObservationRequest) returns (GameObservation);
+
   // Session management (multi-session mode)
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
@@ -67,6 +71,9 @@ message GameObservation {
     // Resumen modo espectador por bando (evaluacion / metricas). NO debe
     // usarse para decidir: el agente sigue con su obs con niebla.
     RlGlobalSummary global_summary = 21;
+
+    // Player slot this observation belongs to (e.g. "Multi1"). Empty = legacy primary.
+    string player_slot = 22;
   }
 
   message RlGlobalSummary {
@@ -226,6 +233,11 @@ message StateRequest {
   string session_id = 1;  // Route to specific session (multi-session mode)
 }
 
+message ObservationRequest {
+  string session_id = 1;
+  string player_slot = 2;  // e.g. "Multi0" / "Multi1"; empty = primary
+}
+
 // ─── Fast Advance (Unary) ───────────────────────────────────────────────────
 
 message FastAdvanceRequest {
@@ -238,6 +250,11 @@ message FastAdvanceRequest {
   // 0 = disabled (legacy behavior: advance full ticks, no interrupt checks).
   int32 check_events_every = 4;
   repeated string enabled_interrupts = 5;  // Signal names: "enemy_spotted", "building_discovered", etc.
+
+  // RL-vs-RL: inject these commands into peer_slot's ExternalBotBridge before
+  // ticking (no second FastAdvance). Empty peer_commands = bot/scripted Multi0.
+  repeated Command peer_commands = 6;
+  string peer_slot = 7;  // default "Multi0" when peer_commands non-empty
 }
 
 // ─── Session Management (Multi-Session Mode) ────────────────────────────────

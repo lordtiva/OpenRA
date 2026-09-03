@@ -65,6 +65,15 @@ namespace OpenRA.Mods.Common.Traits
 		internal static readonly ConcurrentDictionary<string, ExternalBotBridge> Sessions = new();
 
 		/// <summary>
+		/// Per-player bridges in one session (RL-vs-RL). Key = sessionId + "|" + player.InternalName.
+		/// Sessions[sessionId] still points at the primary (learner / Multi1) for FastAdvance routing.
+		/// </summary>
+		internal static readonly ConcurrentDictionary<string, ExternalBotBridge> PlayerSessions = new();
+
+		static string PlayerKey(string sessionId, string playerSlot) =>
+			sessionId + "|" + playerSlot;
+
+		/// <summary>
 		/// True when running in multi-session mode (RLSessionManager manages lifecycle).
 		/// When false, the bridge manages its own gRPC server and calls Game.Exit() on teardown.
 		/// </summary>
@@ -395,8 +404,12 @@ namespace OpenRA.Mods.Common.Traits
 			observationSerializer = new ObservationSerializer(world, player, episodeId);
 			actionHandler = new ActionHandler(world, player);
 
-			// Register in the session registry
-			Sessions[episodeId] = this;
+			// Register in the session registry (primary + per-player for RL-vs-RL).
+			// Prefer Multi1 as Sessions[episodeId] so FastAdvance keeps routing to the learner
+			// even when Multi0 is also an rl-agent.
+			PlayerSessions[PlayerKey(episodeId, p.InternalName)] = this;
+			if (p.InternalName == "Multi1" || !Sessions.ContainsKey(episodeId))
+				Sessions[episodeId] = this;
 
 			// Pause game until RL agent connects (gives LLM time to plan)
 			if (MultiSessionMode)
@@ -480,16 +493,40 @@ namespace OpenRA.Mods.Common.Traits
 		/// </summary>
 		internal void Deactivate()
 		{
-			Sessions.TryRemove(episodeId, out _);
-			SessionDone.Set();
-			TickRequested.Set(); // Wake tick loop so it can exit
+			var slot = player?.InternalName ?? "";
+			if (!string.IsNullOrEmpty(slot))
+				PlayerSessions.TryRemove(PlayerKey(episodeId, slot), out _);
+
+			var isPrimary = Sessions.TryGetValue(episodeId, out var primary)
+				&& ReferenceEquals(primary, this);
 
 			// Complete any pending FastAdvance so the gRPC call doesn't hang forever
 			pendingAdvanceResult?.TrySetCanceled();
 			pendingRealtimeSnapshot = false;
 			TryStopPpoSidecar();
 
-			Log.Write("rl-bridge", $"Session {episodeId} deactivated");
+			if (isPrimary)
+			{
+				Sessions.TryRemove(episodeId, out _);
+				// Drop any remaining peer bridges for this session
+				var peerKeys = new List<string>();
+				foreach (var kvp in PlayerSessions)
+				{
+					if (kvp.Key.StartsWith(episodeId + "|", StringComparison.Ordinal))
+						peerKeys.Add(kvp.Key);
+				}
+				foreach (var key in peerKeys)
+					PlayerSessions.TryRemove(key, out _);
+
+				SessionDone.Set();
+				TickRequested.Set(); // Wake tick loop so it can exit
+				Log.Write("rl-bridge", $"Session {episodeId} deactivated (primary {slot})");
+			}
+			else
+			{
+				IsEnabled = false;
+				Log.Write("rl-bridge", $"Session {episodeId} peer {slot} deactivated");
+			}
 		}
 
 		internal bool HasPendingAdvance => pendingAdvanceResult != null;
@@ -1124,7 +1161,8 @@ namespace OpenRA.Mods.Common.Traits
 		/// </summary>
 		internal async Task<RLProto.GameObservation> RequestFastAdvance(
 			int ticks, IEnumerable<RLProto.Command> commands, CancellationToken ct,
-			int checkEventsEvery = 0, IEnumerable<string> enabledInterruptNames = null)
+			int checkEventsEvery = 0, IEnumerable<string> enabledInterruptNames = null,
+			IEnumerable<RLProto.Command> peerCommands = null, string peerSlot = null)
 		{
 			// Fail fast if session is already dead
 			if (SessionDone.IsSet)
@@ -1139,6 +1177,19 @@ namespace OpenRA.Mods.Common.Traits
 			// Connect agent if this is the first call (unpauses game)
 			if (!agentConnected)
 				OnAgentConnected();
+
+			// RL-vs-RL: push peer commands into the other rl-agent bridge before we tick.
+			// Both bridges' ITick run on each world tick, so peer orders issue in the same advance.
+			if (peerCommands != null)
+			{
+				var slot = string.IsNullOrEmpty(peerSlot) ? "Multi0" : peerSlot;
+				var peer = LookupPlayerSession(episodeId, slot);
+				if (peer != null && !ReferenceEquals(peer, this))
+					peer.EnqueueCommandsOnly(peerCommands);
+				else if (peer == null)
+					Log.Write("rl-bridge",
+						$"FastAdvance peer_commands ignored — no bridge for {episodeId}|{slot}");
+			}
 
 			var n = Math.Max(1, Math.Min(ticks, 5000));
 
@@ -1468,7 +1519,8 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		/// <summary>
-		/// Look up a session by ID. If sessionId is empty, returns the first (only) session
+		/// Look up the primary bridge for a session (learner / Multi1).
+		/// If sessionId is empty, returns the first (only) session
 		/// for backward compatibility with single-session mode.
 		/// </summary>
 		internal static ExternalBotBridge LookupSession(string sessionId)
@@ -1485,5 +1537,65 @@ namespace OpenRA.Mods.Common.Traits
 
 			return null;
 		}
+
+		/// <summary>
+		/// Look up a per-player bridge (RL-vs-RL). Empty playerSlot → primary.
+		/// </summary>
+		internal static ExternalBotBridge LookupPlayerSession(string sessionId, string playerSlot)
+		{
+			if (string.IsNullOrEmpty(playerSlot))
+				return LookupSession(sessionId);
+
+			if (string.IsNullOrEmpty(sessionId))
+			{
+				foreach (var kvp in PlayerSessions)
+				{
+					if (kvp.Key.EndsWith("|" + playerSlot, StringComparison.Ordinal))
+						return kvp.Value;
+				}
+
+				return LookupSession("");
+			}
+
+			PlayerSessions.TryGetValue(PlayerKey(sessionId, playerSlot), out var bridge);
+			return bridge;
+		}
+
+		/// <summary>
+		/// Queue commands for this player without advancing (peer half of RL-vs-RL step).
+		/// Does not unpause — primary FastAdvance owns world pause.
+		/// </summary>
+		internal void EnqueueCommandsOnly(IEnumerable<RLProto.Command> commands)
+		{
+			if (commands == null)
+				return;
+			var cmds = commands.ToList();
+			if (cmds.Count == 0)
+				return;
+
+			agentConnected = true;
+			var action = new RLProto.AgentAction();
+			action.Commands.Add(cmds);
+			actionChannel.Writer.TryWrite(action);
+		}
+
+		/// <summary>Serialize current observation for this player's fog/economy view.</summary>
+		internal RLProto.GameObservation SerializeObservationNow()
+		{
+			if (observationSerializer == null)
+				throw new InvalidOperationException($"Bridge {episodeId} not activated");
+			var obs = observationSerializer.Serialize(world.WorldTick);
+			obs.PlayerSlot = player?.InternalName ?? "";
+			if (world.IsGameOver)
+			{
+				obs.Done = true;
+				obs.Result = player != null && player.WinState == WinState.Won ? "win" : "lose";
+			}
+
+			return obs;
+		}
+
+		/// <summary>Player.InternalName for this bridge (Multi0 / Multi1).</summary>
+		internal string PlayerSlotName => player?.InternalName ?? "";
 	}
 }
