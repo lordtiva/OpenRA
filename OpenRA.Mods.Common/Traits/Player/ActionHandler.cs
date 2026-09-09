@@ -33,6 +33,12 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			foreach (var command in agentAction.Commands)
 			{
+				if (command.Action == RLProto.ActionType.Patrol)
+				{
+					QueuePatrol(command, bot);
+					continue;
+				}
+
 				var order = ConvertCommand(command);
 				if (order != null)
 					bot.QueueOrder(order);
@@ -107,6 +113,9 @@ namespace OpenRA.Mods.Common.Traits
 				case RLProto.ActionType.ArmyAttackMove:
 					return CreateArmyAttackMoveOrder(cmd);
 
+				case RLProto.ActionType.SupportPower:
+					return CreateSupportPowerOrder(cmd);
+
 				case RLProto.ActionType.FastAdvance:
 					// Handled by ExternalBotBridge directly (not an Order)
 					return null;
@@ -179,7 +188,13 @@ namespace OpenRA.Mods.Common.Traits
 				if (targetActor == null || targetActor.IsDead || !targetActor.IsInWorld)
 					return null;
 
-				return new Order("Attack", subject, Target.FromActor(targetActor), cmd.Queued);
+				var target = Target.FromActor(targetActor);
+				// Aliados: engineer Capture / spy Infiltrate without a new ActionType.
+				if (subject.TraitOrDefault<Captures>() != null)
+					return new Order("CaptureActor", subject, target, cmd.Queued);
+				if (string.Equals(subject.Info.Name, "spy", StringComparison.OrdinalIgnoreCase))
+					return new Order("Infiltrate", subject, target, cmd.Queued);
+				return new Order("Attack", subject, target, cmd.Queued);
 			}
 
 			// Attack-ground at position
@@ -245,7 +260,105 @@ namespace OpenRA.Mods.Common.Traits
 			if (subject == null || subject.IsDead || !subject.IsInWorld)
 				return null;
 
+			// Chrono Tank (Germany): PortableChronoTeleport to the sampled cell.
+			if (string.Equals(subject.Info.Name, "ctnk", StringComparison.OrdinalIgnoreCase)
+				&& (cmd.TargetX != 0 || cmd.TargetY != 0))
+			{
+				var cell = new CPos(cmd.TargetX, cmd.TargetY);
+				if (world.Map.Contains(cell))
+					return new Order("PortableChronoTeleport", subject, Target.FromCell(world, cell), cmd.Queued);
+			}
+
 			return new Order("DeployTransform", subject, false);
+		}
+
+		void QueuePatrol(RLProto.Command cmd, IBot bot)
+		{
+			var subject = world.GetActorById(cmd.ActorId);
+			if (subject == null || subject.IsDead || !subject.IsInWorld)
+				return;
+
+			var destCell = new CPos(cmd.TargetX, cmd.TargetY);
+			if (!world.Map.Contains(destCell))
+				return;
+
+			var dest = Target.FromCell(world, destCell);
+			var home = Target.FromCell(world, subject.Location);
+			bot.QueueOrder(new Order("AttackMove", subject, dest, false));
+			bot.QueueOrder(new Order("AttackMove", subject, home, true));
+		}
+
+		Order CreateSupportPowerOrder(RLProto.Command cmd)
+		{
+			var spm = player.PlayerActor.TraitOrDefault<SupportPowerManager>();
+			if (spm == null)
+				return null;
+
+			var key = cmd.ItemType;
+			if (string.IsNullOrEmpty(key))
+			{
+				foreach (var kv in spm.Powers)
+				{
+					if (kv.Value != null && kv.Value.Ready
+						&& kv.Key.IndexOf("Gps", StringComparison.OrdinalIgnoreCase) < 0)
+					{
+						key = kv.Key;
+						break;
+					}
+				}
+			}
+
+			if (string.IsNullOrEmpty(key) || !spm.Powers.ContainsKey(key) || !spm.Powers[key].Ready)
+				return null;
+
+			var dest = new CPos(cmd.TargetX, cmd.TargetY);
+			if (!world.Map.Contains(dest))
+			{
+				dest = CPos.Zero;
+				foreach (var a in world.Actors)
+				{
+					if (a.Owner != player || a.IsDead || !a.IsInWorld)
+						continue;
+					if (string.Equals(a.Info.Name, "fact", StringComparison.OrdinalIgnoreCase))
+					{
+						dest = a.Location;
+						break;
+					}
+				}
+
+				if (!world.Map.Contains(dest))
+					return null;
+			}
+
+			var order = new Order(key, player.PlayerActor, Target.FromCell(world, dest), false)
+			{
+				SuppressVisualFeedback = true
+			};
+
+			// Chronoshift: ExtraLocation is the SOURCE footprint; actor_id is a
+			// unit standing in that pack. Without it, (0,0) would be the source.
+			var sourceActor = world.GetActorById(cmd.ActorId);
+			if (sourceActor == null || sourceActor.IsDead || !sourceActor.IsInWorld
+				|| sourceActor.Owner != player)
+			{
+				sourceActor = null;
+				foreach (var a in world.ActorsHavingTrait<IPositionable>())
+				{
+					if (a.Owner != player || a.IsDead || !a.IsInWorld)
+						continue;
+					if (a.TraitOrDefault<Harvester>() != null)
+						continue;
+					if (string.Equals(a.Info.Name, "mcv", StringComparison.OrdinalIgnoreCase)
+						|| string.Equals(a.Info.Name, "fact", StringComparison.OrdinalIgnoreCase))
+						continue;
+					sourceActor = a;
+					break;
+				}
+			}
+
+			order.ExtraLocation = sourceActor != null ? sourceActor.Location : dest;
+
+			return order;
 		}
 
 		Order CreateSellOrder(RLProto.Command cmd)

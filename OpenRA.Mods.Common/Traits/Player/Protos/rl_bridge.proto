@@ -74,6 +74,8 @@ message GameObservation {
 
     // Player slot this observation belongs to (e.g. "Multi1"). Empty = legacy primary.
     string player_slot = 22;
+    // SupportPowerManager keys that are Ready (Chronoshift, NukePowerOrder, ...).
+    repeated string ready_support_powers = 23;
   }
 
   message RlGlobalSummary {
@@ -215,6 +217,7 @@ enum ActionType {
   FAST_ADVANCE = 21;
   PATROL = 22;          // Patrol between current position and target
   ARMY_ATTACK_MOVE = 23;
+  SUPPORT_POWER = 24;   // Fire a ready support power (item_type = OrderName)
 }
 
 // ─── State Query ─────────────────────────────────────────────────────────────
@@ -263,6 +266,11 @@ message CreateSessionRequest {
   string map_name = 1;    // Map filename or UID
   string bots = 2;        // Bot config: "Multi1:rl-agent,Multi0:beginner"
   int32 seed = 3;         // Random seed (0 = random)
+  // Empty → C# default RandomAllies on the rl-agent slot (doc 24).
+  // Valid: RandomAllies, england, france, germany (not Random: rewritten).
+  string player_faction = 4;
+  // Empty → Random for scripted/other slots.
+  string enemy_faction = 5;
 }
 
 message CreateSessionResponse {

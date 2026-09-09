@@ -81,6 +81,7 @@ namespace OpenRA.Mods.Common.Traits
 			SerializeOwnedActors(obs);
 			SerializeVisibleEnemies(obs);
 			SerializeProduction(obs);
+			SerializeSupportPowers(obs);
 			SerializeSpatialMap(obs);
 
 			return obs;
@@ -458,6 +459,18 @@ namespace OpenRA.Mods.Common.Traits
 					foreach (var buildable in queue.BuildableItems())
 						obs.AvailableProduction.Add(buildable.Name);
 				}
+			}
+		}
+
+		void SerializeSupportPowers(RLProto.GameObservation obs)
+		{
+			var spm = player.PlayerActor.TraitOrDefault<SupportPowerManager>();
+			if (spm == null)
+				return;
+			foreach (var kv in spm.Powers)
+			{
+				if (kv.Value != null && kv.Value.Ready)
+					obs.ReadySupportPowers.Add(kv.Key);
 			}
 		}
 

@@ -191,16 +191,19 @@ namespace OpenRA.Mods.Common.Traits
 		/// the game world is created asynchronously on a background thread.
 		/// FastAdvance will wait for the bridge to activate before proceeding.
 		/// </summary>
-		public static string CreateSession(string mapName, string bots, int seed)
+		public static string CreateSession(string mapName, string bots, int seed,
+			string playerFaction = null, string enemyFaction = null)
 		{
 			var sessionId = Guid.NewGuid().ToString("N")[..12];
-			Log.Write("rl-bridge", $"Creating session {sessionId}: map={mapName}, bots={bots}, seed={seed}");
+			Log.Write("rl-bridge",
+				$"Creating session {sessionId}: map={mapName}, bots={bots}, seed={seed}, " +
+				$"playerFaction={playerFaction ?? ""}, enemyFaction={enemyFaction ?? ""}");
 
 			var thread = new Thread(() =>
 			{
 				try
 				{
-					InitSession(sessionId, mapName, bots, seed);
+					InitSession(sessionId, mapName, bots, seed, playerFaction, enemyFaction);
 				}
 				catch (Exception e)
 				{
@@ -360,7 +363,8 @@ namespace OpenRA.Mods.Common.Traits
 		/// Initialize a game session: create World, find bridge, register state.
 		/// The calling thread exits after this returns — no persistent tick loop.
 		/// </summary>
-		static void InitSession(string sessionId, string mapName, string bots, int seed)
+		static void InitSession(string sessionId, string mapName, string bots, int seed,
+			string playerFaction = null, string enemyFaction = null)
 		{
 			// 1. Resolve map (cached — only first request per map name hits MapCache).
 			//    MapCache.GetEnumerator() calls UpdateMaps() which mutates collections,
@@ -450,7 +454,7 @@ namespace OpenRA.Mods.Common.Traits
 			var orderManager = new OrderManager(connection);
 
 			// 5. Build LobbyInfo with map slots and bot assignments
-			SetupLobbyInfo(orderManager, mapPreview, map, bots, seed);
+			SetupLobbyInfo(orderManager, mapPreview, map, bots, seed, playerFaction, enemyFaction);
 
 			// 6. World creation + LoadComplete (serialized — traits access shared state).
 			//    With PrepareMap cached and map lookup cached, the lock only covers
@@ -533,7 +537,31 @@ namespace OpenRA.Mods.Common.Traits
 		/// <summary>
 		/// Build LobbyInfo for a game session with the specified bot configuration.
 		/// </summary>
-		static void SetupLobbyInfo(OrderManager orderManager, MapPreview mapPreview, Map map, string botsConfig, int seed)
+		static bool IsRlAgentBot(string botType)
+		{
+			return string.Equals(botType, "rl-agent", StringComparison.OrdinalIgnoreCase)
+				|| string.Equals(botType, "rl", StringComparison.OrdinalIgnoreCase);
+		}
+
+		/// <summary>
+		/// Aliados (rl/docs/contract/ra-aliados.md): Empty / Random → RandomAllies
+		/// (england|france|germany). Explicit england/france/germany pass through.
+		/// </summary>
+		internal static string ResolvePlayerFaction(string asked)
+		{
+			if (string.IsNullOrWhiteSpace(asked)
+				|| string.Equals(asked, "Random", StringComparison.OrdinalIgnoreCase))
+				return "RandomAllies";
+			return asked;
+		}
+
+		static string ResolveEnemyFaction(string asked)
+		{
+			return string.IsNullOrWhiteSpace(asked) ? "Random" : asked;
+		}
+
+		static void SetupLobbyInfo(OrderManager orderManager, MapPreview mapPreview, Map map, string botsConfig, int seed,
+			string playerFaction = null, string enemyFaction = null)
 		{
 			var lobbyInfo = orderManager.LobbyInfo;
 
@@ -605,7 +633,9 @@ namespace OpenRA.Mods.Common.Traits
 						Name = botInfo.Name,
 						Bot = botType,
 						Slot = slotName,
-						Faction = "Random",
+						Faction = IsRlAgentBot(botType)
+							? ResolvePlayerFaction(playerFaction)
+							: ResolveEnemyFaction(enemyFaction),
 						SpawnPoint = 0,
 						Team = 0,
 						Handicap = 0,

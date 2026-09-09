@@ -220,7 +220,8 @@ namespace OpenRA.Mods.Common.Traits
 					"CreateSession is only available in multi-session mode"));
 
 			var sessionId = RLSessionManager.CreateSession(
-				request.MapName, request.Bots, request.Seed);
+				request.MapName, request.Bots, request.Seed,
+				request.PlayerFaction, request.EnemyFaction);
 
 			return Task.FromResult(new RLProto.CreateSessionResponse
 			{
