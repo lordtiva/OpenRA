@@ -43,6 +43,39 @@ namespace OpenRA.Mods.Common.Traits
 		/// </summary>
 		static readonly ConcurrentDictionary<string, byte> CancelledSessions = new();
 
+		/// <summary>
+		/// Session IDs poisoned by FastAdvance DEADLINE / World.Tick hang.
+		/// Never reuse: next episode must CreateSession (new id).
+		/// </summary>
+		static readonly ConcurrentDictionary<string, byte> PoisonedSessions = new();
+
+		/// <summary>
+		/// Hard wall-clock deadline for one FastAdvance (seconds). Matches Python
+		/// client minimum (~90s). Override with OPENRA_RL_FAST_ADVANCE_DEADLINE_S.
+		/// </summary>
+		internal static readonly int FastAdvanceDeadlineSeconds = ReadDeadlineSeconds();
+
+		static int workerSerial;
+
+		static int ReadDeadlineSeconds()
+		{
+			var env = Environment.GetEnvironmentVariable("OPENRA_RL_FAST_ADVANCE_DEADLINE_S");
+			if (int.TryParse(env, out var s) && s >= 5 && s <= 900)
+				return s;
+			return 90;
+		}
+
+		internal static bool IsPoisoned(string sessionId) =>
+			!string.IsNullOrEmpty(sessionId) && PoisonedSessions.ContainsKey(sessionId);
+
+		internal static int ActiveSessionCount => SessionStates.Count;
+
+		internal static string FormatActiveSessions()
+		{
+			var ids = SessionStates.Keys.OrderBy(k => k).ToArray();
+			return $"active_sessions={ids.Length} [{string.Join(",", ids)}]";
+		}
+
 		/// <summary>Cache resolved MapPreview by map name to avoid repeated MapCache enumeration.</summary>
 		static readonly ConcurrentDictionary<string, MapPreview> ResolvedMaps = new();
 
@@ -80,6 +113,9 @@ namespace OpenRA.Mods.Common.Traits
 			public readonly SessionState State;
 			public readonly ExternalBotBridge Bridge;
 			public readonly TaskCompletionSource<bool> Completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+			public readonly CancellationTokenSource CancelSource = new();
+			public readonly DateTime StartedUtc = DateTime.UtcNow;
+			public volatile bool Aborted;
 
 			public WorkItem(SessionState s, ExternalBotBridge b) { State = s; Bridge = b; }
 		}
@@ -112,7 +148,9 @@ namespace OpenRA.Mods.Common.Traits
 				workers[i].Start();
 			}
 
-			Log.Write("rl-bridge", $"RLSessionManager initialized: {workerCount} workers, queue capacity {workerCount * 4}");
+			Log.Write("rl-bridge",
+				$"RLSessionManager initialized: {workerCount} workers, queue capacity {workerCount * 4}, "
+				+ $"fast_advance_deadline_s={FastAdvanceDeadlineSeconds}");
 		}
 
 		/// <summary>
@@ -127,29 +165,48 @@ namespace OpenRA.Mods.Common.Traits
 				state.ActiveWorkItem = item;
 				try
 				{
+					if (item.Aborted || item.CancelSource.IsCancellationRequested)
+					{
+						item.Bridge.FailPendingAdvance("work cancelled before tick");
+						item.Completed.TrySetCanceled();
+						continue;
+					}
+
 					// Per-session lock: prevents two concurrent FastAdvance calls
 					// from ticking the same World simultaneously.
 					if (!state.TickLock.Wait(TimeSpan.FromSeconds(20)))
 					{
 						Log.Write("rl-bridge",
-							$"TickLock timeout 20s session {item.Bridge.SessionId}");
+							$"TickLock timeout 20s session {item.Bridge.SessionId} — "
+							+ $"prior advance likely hung | {FormatActiveSessions()}");
 						item.Bridge.FailPendingAdvance("TickLock timeout 20s");
 						item.Completed.TrySetException(
 							new TimeoutException("TickLock timeout 20s"));
+						// Isolate: poison the stuck session so GC frees the slot.
+						PoisonAndDestroy(item.Bridge.SessionId,
+							"TickLock timeout — prior FastAdvance hung in World.Tick");
 						continue;
 					}
 
 					try
 					{
-						TickSession(state, item.Bridge);
-						item.Bridge.CompletePendingAdvance("worker-done");
+						TickSession(state, item.Bridge, item);
+						if (item.Aborted || item.CancelSource.IsCancellationRequested)
+							item.Bridge.FailPendingAdvance("worker-aborted");
+						else
+							item.Bridge.CompletePendingAdvance("worker-done");
 					}
 					finally
 					{
-						state.TickLock.Release();
+						try { state.TickLock.Release(); }
+						catch (ObjectDisposedException) { /* session GC */ }
+						catch (SemaphoreFullException) { /* double-release guard */ }
 					}
 
-					item.Completed.TrySetResult(true);
+					if (item.Aborted || item.CancelSource.IsCancellationRequested)
+						item.Completed.TrySetCanceled();
+					else
+						item.Completed.TrySetResult(true);
 				}
 				catch (Exception e)
 				{
@@ -158,7 +215,9 @@ namespace OpenRA.Mods.Common.Traits
 				}
 				finally
 				{
-					state.ActiveWorkItem = null;
+					if (ReferenceEquals(state.ActiveWorkItem, item))
+						state.ActiveWorkItem = null;
+					try { item.CancelSource.Dispose(); } catch { }
 				}
 			}
 		}
@@ -232,70 +291,178 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		/// <summary>
-		/// Destroy a session and clean up its resources.
+		/// Mark session dead after DEADLINE / hang, abort in-flight work, purge
+		/// registries, and destroy. Guarantees the session_id is never reusable.
+		/// Spawns a replacement worker if World.Tick may be wedged (isolation).
 		/// </summary>
-		public static void DestroySession(string sessionId)
+		internal static void PoisonAndDestroy(string sessionId, string reason)
 		{
+			if (string.IsNullOrEmpty(sessionId))
+				return;
+
+			PoisonedSessions[sessionId] = 0;
 			CancelledSessions[sessionId] = 0;
 
+			Log.Write("rl-bridge",
+				$"PoisonAndDestroy {sessionId}: {reason} | {FormatActiveSessions()}");
+
+			var replaceWorker = false;
+			if (SessionStates.TryGetValue(sessionId, out var state))
+			{
+				var work = state.ActiveWorkItem;
+				if (work != null)
+				{
+					work.Aborted = true;
+					try { work.CancelSource.Cancel(); } catch { }
+					work.Completed.TrySetCanceled();
+					// If past / near deadline, Tick is likely wedged inside World.Tick.
+					if ((DateTime.UtcNow - work.StartedUtc).TotalSeconds
+						>= Math.Max(5, FastAdvanceDeadlineSeconds - 5))
+						replaceWorker = true;
+				}
+			}
+
 			if (ExternalBotBridge.Sessions.TryGetValue(sessionId, out var bridge))
-				bridge.Deactivate();
+			{
+				try { bridge.FailPendingAdvance($"poisoned: {reason}"); } catch { }
+			}
+
+			DestroySession(sessionId, disposeWaitSeconds: 2, forcePurge: true);
+
+			if (replaceWorker)
+				SpawnReplacementWorker();
+
+			Log.Write("rl-bridge",
+				$"PoisonAndDestroy done {sessionId} | {FormatActiveSessions()}");
+		}
+
+		/// <summary>
+		/// Keep the worker pool serving other sessions when one thread is stuck
+		/// inside World.Tick (cannot be aborted safely). Hung thread is abandoned.
+		/// </summary>
+		static void SpawnReplacementWorker()
+		{
+			var i = Interlocked.Increment(ref workerSerial);
+			var t = new Thread(WorkerLoop)
+			{
+				IsBackground = true,
+				Name = $"RL-Worker-repl-{i}"
+			};
+			t.Start();
+			Log.Write("rl-bridge",
+				$"Spawned replacement worker RL-Worker-repl-{i} | {FormatActiveSessions()}");
+		}
+
+		/// <summary>
+		/// Destroy a session and clean up its resources.
+		/// On forcePurge (DEADLINE path): short wait + background dispose so a
+		/// wedged World.Tick cannot block the gRPC host or other sessions.
+		/// </summary>
+		public static void DestroySession(string sessionId)
+			=> DestroySession(sessionId, disposeWaitSeconds: 10, forcePurge: false);
+
+		internal static void DestroySession(string sessionId, int disposeWaitSeconds, bool forcePurge)
+		{
+			CancelledSessions[sessionId] = 0;
+			if (forcePurge)
+				PoisonedSessions[sessionId] = 0;
+
+			if (ExternalBotBridge.Sessions.TryGetValue(sessionId, out var bridge))
+			{
+				try { bridge.Deactivate(); }
+				catch (Exception e)
+				{
+					Log.Write("rl-bridge", $"Deactivate error {sessionId}: {e.Message}");
+				}
+			}
+
+			// Always purge routing tables (zombies must not stay reachable).
+			ExternalBotBridge.Sessions.TryRemove(sessionId, out _);
+			var peerKeys = new List<string>();
+			foreach (var kvp in ExternalBotBridge.PlayerSessions)
+			{
+				if (kvp.Key.StartsWith(sessionId + "|", StringComparison.Ordinal))
+					peerKeys.Add(kvp.Key);
+			}
+			foreach (var key in peerKeys)
+				ExternalBotBridge.PlayerSessions.TryRemove(key, out _);
 
 			if (SessionStates.TryRemove(sessionId, out var state))
 			{
-				// Wait for any in-flight work to finish before disposing
 				var activeWork = state.ActiveWorkItem;
 				if (activeWork != null)
 				{
-					try { activeWork.Completed.Task.Wait(TimeSpan.FromSeconds(10)); }
+					activeWork.Aborted = true;
+					try { activeWork.CancelSource.Cancel(); } catch { }
+					var wait = TimeSpan.FromSeconds(Math.Max(0, disposeWaitSeconds));
+					try { activeWork.Completed.Task.Wait(wait); }
 					catch { /* timeout or cancelled — proceed with dispose */ }
 				}
 
-				try
+				// Dispose off-thread: World.Dispose can also hang if Tick holds locks.
+				var disposeDone = new ManualResetEventSlim(false);
+				ThreadPool.QueueUserWorkItem(_ =>
 				{
-					state.World?.Dispose();
-				}
-				catch (Exception e)
-				{
-					Log.Write("rl-bridge", $"Error disposing world for {sessionId}: {e.Message}");
-				}
+					try { state.World?.Dispose(); }
+					catch (Exception e)
+					{
+						Log.Write("rl-bridge", $"Error disposing world for {sessionId}: {e.Message}");
+					}
 
-				try
-				{
-					state.OrderManager?.Dispose();
-				}
-				catch (Exception e)
-				{
-					Log.Write("rl-bridge", $"Error disposing OrderManager for {sessionId}: {e.Message}");
-				}
+					try { state.OrderManager?.Dispose(); }
+					catch (Exception e)
+					{
+						Log.Write("rl-bridge", $"Error disposing OrderManager for {sessionId}: {e.Message}");
+					}
 
-				// Liberar la memoria RETENIDA del proceso .NET (fix OOM).
-				// world.Dispose() marca objetos huérfanos pero NO los suelta:
-				// MapCache, secuencias y statics de ModData que cada sesión
-				// deja referenciados quedan en gen2 y el proceso sube hasta
-				// OutOfMemory sin un GC forzado (OOM observado a las ~5h con
-				// limit 6G). Forzarlo aquí compacta y devuelve memoria.
-				GC.Collect();
-				GC.WaitForPendingFinalizers();
-				GC.Collect();
+					try { state.TickLock.Dispose(); } catch { }
+					disposeDone.Set();
+				});
+
+				var disposeWait = forcePurge
+					? TimeSpan.FromSeconds(2)
+					: TimeSpan.FromSeconds(Math.Max(1, disposeWaitSeconds));
+				if (!disposeDone.Wait(disposeWait))
+				{
+					Log.Write("rl-bridge",
+						$"DestroySession {sessionId}: dispose still running after "
+						+ $"{disposeWait.TotalSeconds}s — abandoning zombie world; "
+						+ FormatActiveSessions());
+					if (forcePurge)
+						SpawnReplacementWorker();
+				}
+				else
+				{
+					// Liberar la memoria RETENIDA del proceso .NET (fix OOM).
+					GC.Collect();
+					GC.WaitForPendingFinalizers();
+					GC.Collect();
+				}
 			}
 
-			// Capa 0: limpiar early-win state
 			ExternalBotBridge.EarlyWinReasonBySession.TryRemove(sessionId, out _);
-			Log.Write("rl-bridge", $"Session {sessionId} destroyed");
+			// Registries already purged; drop poison mark. New CreateSession always
+			// mints a fresh id — no reuse path remains.
+			PoisonedSessions.TryRemove(sessionId, out _);
+			Log.Write("rl-bridge", $"Session {sessionId} destroyed | {FormatActiveSessions()}");
 		}
 
 		/// <summary>
 		/// Tick a session's game forward until fast-advance completes or game ends.
 		/// Called by worker threads, not by gRPC threads.
+		/// Cooperative cancel: checks WorkItem cancel + wall-clock deadline between
+		/// ticks. Cannot interrupt a single hung World.Tick(); PoisonAndDestroy
+		/// isolates that case by abandoning the worker and purging the session.
 		/// </summary>
-		static void TickSession(SessionState state, ExternalBotBridge bridge)
+		static void TickSession(SessionState state, ExternalBotBridge bridge, WorkItem item)
 		{
 			var orderManager = state.OrderManager;
 			var world = state.World;
 
 			var tickCount = 0;
 			var maxTicks = 10000; // Safety limit
+			var deadlineUtc = item.StartedUtc.AddSeconds(FastAdvanceDeadlineSeconds);
+			var ct = item.CancelSource.Token;
 
 			// Stalock guard (2026-08-25): the world tick can stall mid
 			// fast-forward (game wedged waiting on an actor/order that never
@@ -310,6 +477,18 @@ namespace OpenRA.Mods.Common.Traits
 
 			while (!world.IsGameOver && !bridge.SessionDone.IsSet && tickCount < maxTicks)
 			{
+				if (item.Aborted || ct.IsCancellationRequested || DateTime.UtcNow >= deadlineUtc)
+				{
+					item.Aborted = true;
+					Log.Write("rl-bridge",
+						$"TickSession: abort session {bridge.SessionId} at tick "
+						+ $"{world.WorldTick} (cancel={ct.IsCancellationRequested}, "
+						+ $"deadline={DateTime.UtcNow >= deadlineUtc}, "
+						+ $"aborted={item.Aborted}) | {FormatActiveSessions()}");
+					bridge.FailPendingAdvance("FastAdvance server deadline / cancel");
+					break;
+				}
+
 				orderManager.LastTickTime.Value = 0;
 
 				Sync.RunUnsynced(false, world, () =>

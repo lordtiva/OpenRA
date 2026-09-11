@@ -518,9 +518,12 @@ namespace OpenRA.Mods.Common.Traits
 				foreach (var key in peerKeys)
 					PlayerSessions.TryRemove(key, out _);
 
+				IsEnabled = false;
 				SessionDone.Set();
 				TickRequested.Set(); // Wake tick loop so it can exit
-				Log.Write("rl-bridge", $"Session {episodeId} deactivated (primary {slot})");
+				Log.Write("rl-bridge",
+					$"Session {episodeId} deactivated (primary {slot}) | "
+					+ RLSessionManager.FormatActiveSessions());
 			}
 			else
 			{
@@ -1164,10 +1167,10 @@ namespace OpenRA.Mods.Common.Traits
 			int checkEventsEvery = 0, IEnumerable<string> enabledInterruptNames = null,
 			IEnumerable<RLProto.Command> peerCommands = null, string peerSlot = null)
 		{
-			// Fail fast if session is already dead
-			if (SessionDone.IsSet)
+			// Fail fast if session is already dead / poisoned — never reuse.
+			if (SessionDone.IsSet || RLSessionManager.IsPoisoned(episodeId))
 				throw new RpcException(new Status(StatusCode.Aborted,
-					$"Session {episodeId} is no longer active"));
+					$"Session {episodeId} is no longer active (poisoned/dead) — CreateSession required"));
 
 			// ticks <= 0: GUI skirmish. Inject commands, return current obs,
 			// do NOT set tickScale (the human is playing in real time).
@@ -1253,32 +1256,40 @@ namespace OpenRA.Mods.Common.Traits
 					throw new RpcException(new Status(StatusCode.ResourceExhausted,
 						"All worker slots busy, retry later"));
 
+				// Hard server deadline (default 90s) matching Python client min.
+				// Configurable via OPENRA_RL_FAST_ADVANCE_DEADLINE_S.
+				var fastAdvanceTimeoutMs = RLSessionManager.FastAdvanceDeadlineSeconds * 1000;
+
 				using var reg = ct.Register(() =>
 				{
-					tcs.TrySetCanceled();
+					workItem.Aborted = true;
+					try { workItem.CancelSource.Cancel(); } catch { }
 					workItem.Completed.TrySetCanceled();
+					tcs.TrySetCanceled();
 				});
 
-				// Wait for the worker to finish ticking (non-blocking await) —
-				// with a timeout proportional to requested ticks (min 120s, up to 900s)
-				// to support heavy simulations with multiple concurrent sessions.
-				var fastAdvanceTimeoutMs = Math.Max(120_000, Math.Min(900_000, n * 5_000));
 				try
 				{
-					await workItem.Completed.Task.WaitAsync(TimeSpan.FromMilliseconds(
-						fastAdvanceTimeoutMs), ct);
+					await workItem.Completed.Task.WaitAsync(
+						TimeSpan.FromMilliseconds(fastAdvanceTimeoutMs), ct);
 				}
 				catch (Exception ex) when (ex is TimeoutException
 					or OperationCanceledException)
 				{
-					// Cancel the queued work so the session doesn't stay
-					// wedged; clear the pending TCS as well.
+					// Deterministic GC: abort tick loop, purge registries, never
+					// leave a poisoned session_id reusable. Other sessions keep
+					// running (replacement worker if World.Tick is wedged).
+					workItem.Aborted = true;
+					try { workItem.CancelSource.Cancel(); } catch { }
 					workItem.Completed.TrySetCanceled();
 					tcs.TrySetCanceled();
-					SessionDone.Set();
+					RLSessionManager.PoisonAndDestroy(episodeId,
+						$"FastAdvance deadline {fastAdvanceTimeoutMs}ms "
+						+ $"(tick {world.WorldTick})");
 					throw new RpcException(new Status(StatusCode.DeadlineExceeded,
 						$"FastAdvance timeout ({fastAdvanceTimeoutMs}ms) for session "
-						+ $"{episodeId} (tick {world.WorldTick})"));
+						+ $"{episodeId} (tick {world.WorldTick}); session poisoned — "
+						+ "CreateSession required for next episode"));
 				}
 				return await tcs.Task;
 			}
@@ -1477,7 +1488,8 @@ namespace OpenRA.Mods.Common.Traits
 		/// </summary>
 		internal RLProto.GameState GetCurrentState()
 		{
-			var phase = !IsEnabled ? "waiting"
+			var phase = SessionDone.IsSet || RLSessionManager.IsPoisoned(episodeId) ? "error"
+				: !IsEnabled ? "waiting"
 				: world.IsGameOver ? "game_over"
 				: "playing";
 
@@ -1527,13 +1539,21 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			if (!string.IsNullOrEmpty(sessionId))
 			{
-				Sessions.TryGetValue(sessionId, out var bridge);
+				if (RLSessionManager.IsPoisoned(sessionId))
+					return null;
+				if (!Sessions.TryGetValue(sessionId, out var bridge))
+					return null;
+				if (bridge.SessionDone.IsSet)
+					return null;
 				return bridge;
 			}
 
-			// Legacy fallback: return first available session
+			// Legacy fallback: return first available live session
 			foreach (var kvp in Sessions)
-				return kvp.Value;
+			{
+				if (!kvp.Value.SessionDone.IsSet && !RLSessionManager.IsPoisoned(kvp.Key))
+					return kvp.Value;
+			}
 
 			return null;
 		}

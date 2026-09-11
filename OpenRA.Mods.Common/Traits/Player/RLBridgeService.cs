@@ -39,8 +39,14 @@ namespace OpenRA.Mods.Common.Traits
 			{
 				// Session should already exist (created by CreateSession RPC)
 				// CreateSession now blocks until ready, but keep a generous timeout
+				if (RLSessionManager.IsPoisoned(sessionId))
+					return null;
+
 				for (var i = 0; i < 3000; i++)
 				{
+					if (RLSessionManager.IsPoisoned(sessionId))
+						return null;
+
 					var b = ExternalBotBridge.LookupSession(sessionId);
 					if (b != null && b.IsEnabled)
 						return b;
@@ -161,7 +167,9 @@ namespace OpenRA.Mods.Common.Traits
 			}
 			catch (Exception e)
 			{
-				Log.Write("rl-bridge", $"FastAdvance error for session {request.SessionId}: {e}");
+				Log.Write("rl-bridge",
+					$"FastAdvance error for session {request.SessionId}: {e} | "
+					+ RLSessionManager.FormatActiveSessions());
 				throw;
 			}
 		}
@@ -240,9 +248,20 @@ namespace OpenRA.Mods.Common.Traits
 				throw new RpcException(new Status(StatusCode.Unimplemented,
 					"DestroySession is only available in multi-session mode"));
 
-			// Destroy is best-effort — never fail the RPC
-			try { RLSessionManager.DestroySession(request.SessionId); }
-			catch (Exception e) { Log.Write("rl-bridge", $"DestroySession error: {e}"); }
+			// Destroy is best-effort — never fail the RPC. forcePurge so a hung
+			// World.Tick cannot block cleanup (zombie purge + active_sessions log).
+			try
+			{
+				RLSessionManager.DestroySession(request.SessionId,
+					disposeWaitSeconds: 5, forcePurge: true);
+				Log.Write("rl-bridge",
+					$"DestroySession RPC {request.SessionId} | "
+					+ RLSessionManager.FormatActiveSessions());
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"DestroySession error: {e}");
+			}
 
 			return Task.FromResult(new RLProto.DestroySessionResponse());
 		}
