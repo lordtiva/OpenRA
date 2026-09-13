@@ -257,8 +257,22 @@ namespace OpenRA.Network
 
 				foreach (var order in orders.GetOrders(World))
 				{
-					UnitOrders.ProcessOrder(this, World, clientId, order);
-					processClientOrders.Add(new ClientOrder { Client = clientId, Order = order });
+					try
+					{
+						UnitOrders.ProcessOrder(this, World, clientId, order);
+						processClientOrders.Add(new ClientOrder { Client = clientId, Order = order });
+					}
+					catch (Exception e)
+					{
+						// A single bad order (e.g. Guard on non-Guardable) must not
+						// abort the net frame: that skips ++NetFrameNumber, desyncs
+						// EchoConnection, and permanently stalls RL TickSession
+						// (NO-PROGRESS). Swallow, log, finish the frame.
+						Console.Error.WriteLine(
+							$"[order-manager] ProcessOrder failed frame={NetFrameNumber} client={clientId} order={order.OrderString}: {e.Message}");
+						Log.Write("debug",
+							$"ProcessOrder failed frame={NetFrameNumber} client={clientId} order={order.OrderString}: {e}");
+					}
 				}
 			}
 
@@ -285,6 +299,41 @@ namespace OpenRA.Network
 			processClientsToRemove.Clear();
 
 			++NetFrameNumber;
+		}
+
+
+		/// <summary>
+		/// Repair EchoConnection frame queue after a mid-frame ProcessOrders abort
+		/// left NetFrameNumber behind the queued packets (or empty with sentOrdersFrame
+		/// already advanced). Without this, TryTick never succeeds → NO-PROGRESS.
+		/// </summary>
+		public void RepairEchoPipeline()
+		{
+			foreach (var queue in pendingOrders.Values)
+			{
+				while (queue.Count > 0)
+				{
+					var peek = queue.Peek();
+					if (peek.Frame == NetFrameNumber)
+						break;
+					if (peek.Frame < NetFrameNumber)
+					{
+						queue.Dequeue();
+						continue;
+					}
+
+					// Future frame while we still need NetFrameNumber: drop ahead
+					// packets and inject an empty packet for the current frame.
+					queue.Clear();
+					break;
+				}
+
+				if (queue.Count == 0)
+					queue.Enqueue((NetFrameNumber, new OrderPacket([])));
+			}
+
+			if (sentOrdersFrame >= NetFrameNumber)
+				sentOrdersFrame = NetFrameNumber - 1;
 		}
 
 		public void Dispose()

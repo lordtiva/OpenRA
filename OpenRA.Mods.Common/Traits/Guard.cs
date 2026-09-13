@@ -53,6 +53,12 @@ namespace OpenRA.Mods.Common.Traits
 			if (target.Type != TargetType.Actor)
 				return;
 
+			// RL agents may Guard non-Guardable targets. TraitInfo<T>() throws and
+			// aborts OrderManager.ProcessOrders mid-frame, desyncing EchoConnection
+			// and permanently stalling TickSession (NO-PROGRESS at frozen WorldTick).
+			if (!target.Actor.Info.HasTraitInfo<GuardableInfo>())
+				return;
+
 			var range = target.Actor.Info.TraitInfo<GuardableInfo>().Range;
 			self.QueueActivity(queued, new AttackMoveActivity(self, () => move.MoveFollow(self, target, WDist.Zero, range, targetLineColor: info.TargetLineColor)));
 			self.ShowTargetLines();

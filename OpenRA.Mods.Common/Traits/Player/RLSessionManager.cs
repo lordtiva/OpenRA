@@ -510,9 +510,30 @@ namespace OpenRA.Mods.Common.Traits
 					return true;
 				});
 
-				var didTick = orderManager.TryTick();
-				if (didTick)
-					world.Tick();
+				try
+				{
+					var didTick = orderManager.TryTick();
+					if (didTick)
+						world.Tick();
+				}
+				catch (Exception e)
+				{
+					// Guard/order faults used to abort ProcessOrders mid-frame and
+					// desync EchoConnection → permanent TryTick stall (NO-PROGRESS).
+					// Repair the frame queue and keep going.
+					Console.Error.WriteLine(
+						$"[rl-bridge] TickSession tick-fault session={bridge.SessionId} "
+						+ $"tick={world.WorldTick} paused={world.Paused} "
+						+ $"localFrame={orderManager.LocalFrameNumber} "
+						+ $"netFrame={orderManager.NetFrameNumber}: {e.Message}");
+					Log.Write("rl-bridge",
+						$"TickSession tick-fault session={bridge.SessionId}: {e}");
+					try { orderManager.RepairEchoPipeline(); }
+					catch (Exception re)
+					{
+						Log.Write("rl-bridge", $"RepairEchoPipeline failed: {re.Message}");
+					}
+				}
 
 				tickCount++;
 
@@ -520,17 +541,38 @@ namespace OpenRA.Mods.Common.Traits
 				// the worker releases the TickLock and the daemon stays alive.
 				if (world.WorldTick == lastWorldTick)
 				{
-					if (++noProgressIterations >= MaxNoProgressTicks)
+					++noProgressIterations;
+					// Mid-stall: attempt Echo pipeline repair once (sentOrdersFrame
+					// barrier / frame-ahead packet after a prior abort).
+					if (noProgressIterations == 10)
+					{
+						Console.Error.WriteLine(
+							$"[rl-bridge] TickSession stall-repair session={bridge.SessionId} "
+							+ $"tick={world.WorldTick} paused={world.Paused} "
+							+ $"localFrame={orderManager.LocalFrameNumber} "
+							+ $"netFrame={orderManager.NetFrameNumber}");
+						try { orderManager.RepairEchoPipeline(); }
+						catch (Exception re)
+						{
+							Log.Write("rl-bridge", $"stall-repair failed: {re.Message}");
+						}
+					}
+
+					if (noProgressIterations >= MaxNoProgressTicks)
 					{
 						item.Aborted = true;
 						Console.Error.WriteLine(
 							$"[rl-bridge] TickSession NO-PROGRESS session={bridge.SessionId} "
-							+ $"tick={world.WorldTick} iterations={noProgressIterations}");
+							+ $"tick={world.WorldTick} iterations={noProgressIterations} "
+							+ $"paused={world.Paused} localFrame={orderManager.LocalFrameNumber} "
+							+ $"netFrame={orderManager.NetFrameNumber}");
 						Log.Write("rl-bridge",
 							$"TickSession: NO-PROGRESS for {noProgressIterations} "
 							+ $"iterations at tick {world.WorldTick} (session "
-							+ $"{bridge.SessionId}) — releasing worker to avoid "
-							+ $"deadlock | {FormatActiveSessions()}");
+							+ $"{bridge.SessionId}, paused={world.Paused}, "
+							+ $"localFrame={orderManager.LocalFrameNumber}, "
+							+ $"netFrame={orderManager.NetFrameNumber}) — releasing worker "
+							+ $"to avoid deadlock | {FormatActiveSessions()}");
 						bridge.FailPendingAdvance(
 							$"NO-PROGRESS {noProgressIterations} at tick {world.WorldTick}");
 						break;

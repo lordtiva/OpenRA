@@ -540,6 +540,12 @@ namespace OpenRA.Mods.Common.Traits
 			if (target == null || target.IsDead || !target.IsInWorld)
 				return null;
 
+			// Match GuardOrderGenerator: only Guardable targets are valid.
+			// Issuing Guard on non-Guardable actors throws in Guard.GuardTarget
+			// and aborts ProcessOrders → EchoConnection desync → NO-PROGRESS.
+			if (!target.Info.HasTraitInfo<GuardableInfo>())
+				return null;
+
 			return new Order("Guard", subject, Target.FromActor(target), cmd.Queued);
 		}
 
