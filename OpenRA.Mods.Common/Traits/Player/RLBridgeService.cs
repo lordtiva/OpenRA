@@ -144,6 +144,10 @@ namespace OpenRA.Mods.Common.Traits
 			RLProto.FastAdvanceRequest request,
 			ServerCallContext context)
 		{
+			// Outer wall-clock: RequestFastAdvance has its own deadline, but if
+			// anything blocks before that CTS starts (or a future regression),
+			// this still returns DEADLINE_EXCEEDED and poisons the session.
+			var wallSeconds = RLSessionManager.FastAdvanceDeadlineSeconds + 15;
 			try
 			{
 				var bridge = await WaitForBridge(request.SessionId, context.CancellationToken);
@@ -155,11 +159,39 @@ namespace OpenRA.Mods.Common.Traits
 				IEnumerable<RLProto.Command> peerCmds = null;
 				if (request.PeerCommands != null && request.PeerCommands.Count > 0)
 					peerCmds = request.PeerCommands;
-				return await bridge.RequestFastAdvance(
+
+				var advanceTask = bridge.RequestFastAdvance(
 					request.Ticks, request.Commands, context.CancellationToken,
 					request.CheckEventsEvery,
 					request.EnabledInterrupts.Count > 0 ? request.EnabledInterrupts : null,
 					peerCmds, request.PeerSlot);
+
+				try
+				{
+					return await advanceTask.WaitAsync(
+						TimeSpan.FromSeconds(wallSeconds), context.CancellationToken);
+				}
+				catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+				{
+					if (context.CancellationToken.IsCancellationRequested
+						&& ex is OperationCanceledException
+						&& ex is not TimeoutException)
+					{
+						throw;
+					}
+
+					Console.Error.WriteLine(
+						$"[rl-bridge] RLBridgeService FastAdvance wall-clock "
+						+ $"{wallSeconds}s session={request.SessionId}");
+					Log.Write("rl-bridge",
+						$"RLBridgeService FastAdvance wall-clock {wallSeconds}s "
+						+ $"session={request.SessionId} | {RLSessionManager.FormatActiveSessions()}");
+					RLSessionManager.PoisonAndDestroy(request.SessionId,
+						$"RLBridgeService wall-clock {wallSeconds}s");
+					throw new RpcException(new Status(StatusCode.DeadlineExceeded,
+						$"FastAdvance wall-clock timeout ({wallSeconds}s) for session "
+						+ $"{request.SessionId}; session poisoned — CreateSession required"));
+				}
 			}
 			catch (RpcException)
 			{

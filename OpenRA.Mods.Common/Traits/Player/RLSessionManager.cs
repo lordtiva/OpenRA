@@ -176,6 +176,9 @@ namespace OpenRA.Mods.Common.Traits
 					// from ticking the same World simultaneously.
 					if (!state.TickLock.Wait(TimeSpan.FromSeconds(20)))
 					{
+						Console.Error.WriteLine(
+							$"[rl-bridge] TickLock timeout 20s session={item.Bridge.SessionId} — "
+							+ "prior FastAdvance hung in World.Tick");
 						Log.Write("rl-bridge",
 							$"TickLock timeout 20s session {item.Bridge.SessionId} — "
 							+ $"prior advance likely hung | {FormatActiveSessions()}");
@@ -303,6 +306,8 @@ namespace OpenRA.Mods.Common.Traits
 			PoisonedSessions[sessionId] = 0;
 			CancelledSessions[sessionId] = 0;
 
+			Console.Error.WriteLine(
+				$"[rl-bridge] PoisonAndDestroy {sessionId}: {reason}");
 			Log.Write("rl-bridge",
 				$"PoisonAndDestroy {sessionId}: {reason} | {FormatActiveSessions()}");
 
@@ -349,6 +354,8 @@ namespace OpenRA.Mods.Common.Traits
 				Name = $"RL-Worker-repl-{i}"
 			};
 			t.Start();
+			Console.Error.WriteLine(
+				$"[rl-bridge] Spawned replacement worker RL-Worker-repl-{i}");
 			Log.Write("rl-bridge",
 				$"Spawned replacement worker RL-Worker-repl-{i} | {FormatActiveSessions()}");
 		}
@@ -459,6 +466,9 @@ namespace OpenRA.Mods.Common.Traits
 			var orderManager = state.OrderManager;
 			var world = state.World;
 
+			// Under TickLock: safe place for ActorsHavingTrait (gRPC thread must not).
+			bridge.PrepareInterruptSnapshot();
+
 			var tickCount = 0;
 			var maxTicks = 10000; // Safety limit
 			var deadlineUtc = item.StartedUtc.AddSeconds(FastAdvanceDeadlineSeconds);
@@ -473,13 +483,16 @@ namespace OpenRA.Mods.Common.Traits
 			// TickLock is freed and the daemon keeps serving other sessions.
 			var lastWorldTick = 0;
 			var noProgressIterations = 0;
-			const int MaxNoProgressTicks = 200; // ~200 game ticks of stall
+			const int MaxNoProgressTicks = 50; // bail faster; World.Tick hang still needs poison
 
 			while (!world.IsGameOver && !bridge.SessionDone.IsSet && tickCount < maxTicks)
 			{
 				if (item.Aborted || ct.IsCancellationRequested || DateTime.UtcNow >= deadlineUtc)
 				{
 					item.Aborted = true;
+					Console.Error.WriteLine(
+						$"[rl-bridge] TickSession abort session={bridge.SessionId} tick={world.WorldTick} "
+						+ $"(cancel={ct.IsCancellationRequested}, deadline={DateTime.UtcNow >= deadlineUtc})");
 					Log.Write("rl-bridge",
 						$"TickSession: abort session {bridge.SessionId} at tick "
 						+ $"{world.WorldTick} (cancel={ct.IsCancellationRequested}, "
@@ -509,11 +522,17 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					if (++noProgressIterations >= MaxNoProgressTicks)
 					{
+						item.Aborted = true;
+						Console.Error.WriteLine(
+							$"[rl-bridge] TickSession NO-PROGRESS session={bridge.SessionId} "
+							+ $"tick={world.WorldTick} iterations={noProgressIterations}");
 						Log.Write("rl-bridge",
 							$"TickSession: NO-PROGRESS for {noProgressIterations} "
 							+ $"iterations at tick {world.WorldTick} (session "
 							+ $"{bridge.SessionId}) — releasing worker to avoid "
-							+ $"deadlock");
+							+ $"deadlock | {FormatActiveSessions()}");
+						bridge.FailPendingAdvance(
+							$"NO-PROGRESS {noProgressIterations} at tick {world.WorldTick}");
 						break;
 					}
 				}

@@ -174,7 +174,7 @@ namespace OpenRA.Mods.Common.Traits
 		// Track which own units were moving (not idle) for unit_arrived detection
 		readonly HashSet<uint> prevMovingUnitIds = new();
 
-		// Cached actor references: populated once at advance start via SnapshotActors(),
+		// Cached actor references: populated under TickLock via PrepareInterruptSnapshot(),
 		// then reused for fast delta checks. Full refresh every 4th check to catch
 		// newly spawned actors (harvesters, produced units). This avoids expensive
 		// ActorsHavingTrait<T>() enumeration on every check across 64 sessions.
@@ -910,7 +910,9 @@ namespace OpenRA.Mods.Common.Traits
 
 		/// <summary>
 		/// Snapshot all Mobile and Building actors into cached lists.
-		/// Called once at advance start and refreshed every FullRefreshEveryNChecks.
+		/// Called under TickLock from TickSession (never from the gRPC thread —
+		/// ActorsHavingTrait can wedge forever if World.Tick is hung).
+		/// Also refreshed every FullRefreshEveryNChecks from ITick.
 		/// </summary>
 		void SnapshotActors()
 		{
@@ -918,6 +920,35 @@ namespace OpenRA.Mods.Common.Traits
 			cachedMobileActors.AddRange(world.ActorsHavingTrait<Mobile>());
 			cachedBuildingActors.Clear();
 			cachedBuildingActors.AddRange(world.ActorsHavingTrait<Building>());
+		}
+
+		/// <summary>
+		/// Prepare interrupt actor cache once TickLock is held. Skip on failure
+		/// so a wedged World cannot block the FastAdvance deadline path.
+		/// </summary>
+		internal void PrepareInterruptSnapshot()
+		{
+			if (interruptCheckInterval <= 0)
+				return;
+
+			try
+			{
+				SnapshotActors();
+				Console.Error.WriteLine(
+					$"[rl-bridge] FastAdvance interrupt snapshot: "
+					+ $"{cachedMobileActors.Count} mobile + {cachedBuildingActors.Count} buildings "
+					+ $"(session {episodeId}, tick {world.WorldTick}, "
+					+ $"every {interruptCheckInterval}, signals {enabledInterrupts.Count})");
+			}
+			catch (Exception e)
+			{
+				Console.Error.WriteLine(
+					$"[rl-bridge] SnapshotActors FAILED session={episodeId} tick={world.WorldTick}: {e.Message} — skipping cache");
+				Log.Write("rl-bridge",
+					$"PrepareInterruptSnapshot failed session={episodeId}: {e}");
+				cachedMobileActors.Clear();
+				cachedBuildingActors.Clear();
+			}
 		}
 
 		/// <summary>
@@ -1196,24 +1227,28 @@ namespace OpenRA.Mods.Common.Traits
 
 			var n = Math.Max(1, Math.Min(ticks, 5000));
 
-			// Configure server-side interrupt detection
+			// Configure server-side interrupt detection (cheap field writes only).
+			// SnapshotActors MUST NOT run on the gRPC thread: if World/TickLock is
+			// wedged, ActorsHavingTrait blocks forever and the deadline never starts.
+			// Worker calls PrepareInterruptSnapshot() under TickLock instead.
 			interruptCheckInterval = Math.Max(0, checkEventsEvery);
-			fastAdvanceStartTick = world.WorldTick;
-			interruptNextCheckTick = world.WorldTick + Math.Max(interruptCheckInterval, 1);
+			try
+			{
+				fastAdvanceStartTick = world.WorldTick;
+				interruptNextCheckTick = world.WorldTick + Math.Max(interruptCheckInterval, 1);
+			}
+			catch
+			{
+				fastAdvanceStartTick = 0;
+				interruptNextCheckTick = 1;
+			}
+
 			pendingInterruptReason = null;
 			interruptCheckCount = 0;
 			enabledInterrupts.Clear();
 			if (enabledInterruptNames != null)
 				foreach (var name in enabledInterruptNames)
 					enabledInterrupts.Add(name);
-
-			// Snapshot actors once at advance start — CheckInterrupts uses cached lists
-			// instead of expensive ActorsHavingTrait calls on every check
-			if (interruptCheckInterval > 0)
-			{
-				SnapshotActors();
-				Console.Error.WriteLine($"[rl-bridge] FastAdvance {n} ticks with interrupt check every {interruptCheckInterval} ticks, {enabledInterrupts.Count} signals, {cachedMobileActors.Count} mobile + {cachedBuildingActors.Count} buildings cached (session {episodeId})");
-			}
 
 			// Set up the TCS before queueing — worker will complete it via ITick.Tick.
 			// Keep a local reference because ITick.Tick nulls the field after completion.
@@ -1236,31 +1271,78 @@ namespace OpenRA.Mods.Common.Traits
 
 			if (MultiSessionMode)
 			{
+				// Hard wall-clock deadline starts IMMEDIATELY (before SessionStates
+				// wait / SubmitWork). Override via OPENRA_RL_FAST_ADVANCE_DEADLINE_S.
+				var deadlineSeconds = RLSessionManager.FastAdvanceDeadlineSeconds;
+				var fastAdvanceTimeoutMs = deadlineSeconds * 1000;
+				using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+				deadlineCts.CancelAfter(TimeSpan.FromSeconds(deadlineSeconds));
+				var deadlineToken = deadlineCts.Token;
+
+				void PoisonDeadline(string why)
+				{
+					var tickSafe = -1;
+					try { tickSafe = world.WorldTick; } catch { /* disposing */ }
+					Console.Error.WriteLine(
+						$"[rl-bridge] FastAdvance DEADLINE session={episodeId} tick={tickSafe} "
+						+ $"timeout={fastAdvanceTimeoutMs}ms reason={why}");
+					Log.Write("rl-bridge",
+						$"FastAdvance DEADLINE session={episodeId} tick={tickSafe} "
+						+ $"timeout={fastAdvanceTimeoutMs}ms reason={why} | "
+						+ RLSessionManager.FormatActiveSessions());
+					tcs.TrySetCanceled();
+					RLSessionManager.PoisonAndDestroy(episodeId,
+						$"FastAdvance deadline {fastAdvanceTimeoutMs}ms ({why}, tick {tickSafe})");
+				}
+
+				RpcException DeadlineRpc(string why)
+				{
+					var tickSafe = -1;
+					try { tickSafe = world.WorldTick; } catch { }
+					return new RpcException(new Status(StatusCode.DeadlineExceeded,
+						$"FastAdvance timeout ({fastAdvanceTimeoutMs}ms) for session "
+						+ $"{episodeId} (tick {tickSafe}; {why}); session poisoned — "
+						+ "CreateSession required for next episode"));
+				}
+
 				// Wait briefly for session state — it may still be registering
 				// if FastAdvance arrives right after the bridge activates during
 				// World creation but before InitSession registers SessionStates.
 				RLSessionManager.SessionState state = null;
 				for (var retry = 0; retry < 50; retry++)
 				{
+					if (deadlineToken.IsCancellationRequested)
+						break;
 					if (RLSessionManager.SessionStates.TryGetValue(episodeId, out state))
 						break;
-					Thread.Sleep(100);
+					try
+					{
+						await Task.Delay(100, deadlineToken);
+					}
+					catch (OperationCanceledException)
+					{
+						break;
+					}
 				}
 
 				if (state == null)
+				{
+					if (deadlineToken.IsCancellationRequested)
+					{
+						PoisonDeadline("session-state-wait");
+						throw DeadlineRpc("session-state-wait");
+					}
+
 					throw new RpcException(new Status(StatusCode.NotFound,
 						$"Session state not found for {episodeId}"));
+				}
 
 				var workItem = RLSessionManager.SubmitWork(state, this);
 				if (workItem == null)
 					throw new RpcException(new Status(StatusCode.ResourceExhausted,
 						"All worker slots busy, retry later"));
 
-				// Hard server deadline (default 90s) matching Python client min.
-				// Configurable via OPENRA_RL_FAST_ADVANCE_DEADLINE_S.
-				var fastAdvanceTimeoutMs = RLSessionManager.FastAdvanceDeadlineSeconds * 1000;
-
-				using var reg = ct.Register(() =>
+				using var reg = deadlineToken.Register(() =>
 				{
 					workItem.Aborted = true;
 					try { workItem.CancelSource.Cancel(); } catch { }
@@ -1268,29 +1350,64 @@ namespace OpenRA.Mods.Common.Traits
 					tcs.TrySetCanceled();
 				});
 
+				// Always return by deadline even if Completed never signals and/or
+				// the observation TCS is left incomplete after Completed.
+				var timeoutTask = Task.Delay(Timeout.InfiniteTimeSpan, deadlineToken);
+				Task finished;
 				try
 				{
-					await workItem.Completed.Task.WaitAsync(
-						TimeSpan.FromMilliseconds(fastAdvanceTimeoutMs), ct);
+					finished = await Task.WhenAny(
+						workItem.Completed.Task, tcs.Task, timeoutTask);
 				}
-				catch (Exception ex) when (ex is TimeoutException
-					or OperationCanceledException)
+				catch (OperationCanceledException)
 				{
-					// Deterministic GC: abort tick loop, purge registries, never
-					// leave a poisoned session_id reusable. Other sessions keep
-					// running (replacement worker if World.Tick is wedged).
 					workItem.Aborted = true;
 					try { workItem.CancelSource.Cancel(); } catch { }
 					workItem.Completed.TrySetCanceled();
-					tcs.TrySetCanceled();
-					RLSessionManager.PoisonAndDestroy(episodeId,
-						$"FastAdvance deadline {fastAdvanceTimeoutMs}ms "
-						+ $"(tick {world.WorldTick})");
-					throw new RpcException(new Status(StatusCode.DeadlineExceeded,
-						$"FastAdvance timeout ({fastAdvanceTimeoutMs}ms) for session "
-						+ $"{episodeId} (tick {world.WorldTick}); session poisoned — "
-						+ "CreateSession required for next episode"));
+					PoisonDeadline("whenany-cancel");
+					throw DeadlineRpc("whenany-cancel");
 				}
+
+				if (finished == timeoutTask || deadlineToken.IsCancellationRequested)
+				{
+					workItem.Aborted = true;
+					try { workItem.CancelSource.Cancel(); } catch { }
+					workItem.Completed.TrySetCanceled();
+					PoisonDeadline("wall-clock");
+					throw DeadlineRpc("wall-clock");
+				}
+
+				// Observe worker completion faults (do not hang on bare tcs await).
+				if (workItem.Completed.Task.IsFaulted)
+				{
+					FailPendingAdvance("worker-fault");
+					await workItem.Completed.Task; // rethrow
+				}
+
+				if (workItem.Completed.Task.IsCanceled && !tcs.Task.IsCompleted)
+				{
+					workItem.Aborted = true;
+					PoisonDeadline("completed-canceled");
+					throw DeadlineRpc("completed-canceled");
+				}
+
+				// Success path: Completed may signal without completing the TCS
+				// (Serialize hang after nulling pendingAdvanceResult, races, etc.).
+				if (!tcs.Task.IsCompleted)
+				{
+					var bounded = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+					if (bounded != tcs.Task)
+					{
+						workItem.Aborted = true;
+						try { workItem.CancelSource.Cancel(); } catch { }
+						Console.Error.WriteLine(
+							$"[rl-bridge] FastAdvance TCS incomplete after Completed "
+							+ $"session={episodeId} — poisoning");
+						PoisonDeadline("tcs-after-completed");
+						throw DeadlineRpc("tcs-after-completed");
+					}
+				}
+
 				return await tcs.Task;
 			}
 			else
