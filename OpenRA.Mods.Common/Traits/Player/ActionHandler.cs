@@ -431,6 +431,16 @@ namespace OpenRA.Mods.Common.Traits
 					Log.Write("rl-bridge", $"Placing '{cmd.ItemType}' at requested ({cmd.TargetX},{cmd.TargetY})");
 					return MakePlaceOrder(cmd.ItemType, requestedCell, producer);
 				}
+
+				// Requested cell was toward ore/a mine but slightly illegal
+				// (tree, footprint). Search from THERE, not from the CY —
+				// otherwise every proc dumps on the construction-yard ring.
+				var nearRequested = FindPlacementCell(actorInfo, bi, requestedCell);
+				if (nearRequested.HasValue)
+				{
+					Log.Write("rl-bridge", $"Placing '{cmd.ItemType}' near requested ({cmd.TargetX},{cmd.TargetY}) at ({nearRequested.Value.X},{nearRequested.Value.Y})");
+					return MakePlaceOrder(cmd.ItemType, nearRequested.Value, producer);
+				}
 			}
 
 			// Auto-find: search outward from base center
