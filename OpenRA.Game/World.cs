@@ -207,7 +207,11 @@ namespace OpenRA
 			Timestep = ReplayTimestep = GameSpeed.Timestep;
 
 			SharedRandom = new MersenneTwister(orderManager.LobbyInfo.GlobalSettings.RandomSeed);
-			LocalRandom = new MersenneTwister();
+			// RL training needs reproducible bots: their modules draw from LocalRandom,
+			// so seed it from the lobby seed when OPENRA_RL_DETERMINISTIC=1.
+			LocalRandom = Environment.GetEnvironmentVariable("OPENRA_RL_DETERMINISTIC") == "1"
+				? new MersenneTwister(orderManager.LobbyInfo.GlobalSettings.RandomSeed ^ 0x5EED)
+				: new MersenneTwister();
 
 			var worldActorType = type == WorldType.Editor ? SystemActors.EditorWorld : SystemActors.World;
 			WorldActor = CreateActor(worldActorType.ToString(), []);
