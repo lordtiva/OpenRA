@@ -107,6 +107,11 @@ namespace OpenRA.Traits
 
 		public void Add(IEffect effect, WPos position, Size size)
 		{
+			// Headless RL sessions never get a WorldRenderer: there is nothing to draw.
+			// Throwing here (e.g. the GPS SatelliteLaunch) aborted World.Tick mid-frame.
+			if (worldRenderer == null)
+				return;
+
 			var screenPos = worldRenderer.ScreenPxPosition(position);
 			var screenWidth = Math.Abs(size.Width);
 			var screenHeight = Math.Abs(size.Height);

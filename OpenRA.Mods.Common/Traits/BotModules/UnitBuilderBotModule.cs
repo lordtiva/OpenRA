@@ -86,8 +86,12 @@ namespace OpenRA.Mods.Common.Traits
 
 		void IBotTick.BotTick(IBot bot)
 		{
+			// An external agent owns the production plan: no cash/pause gates, no requests
+			// from other modules (harvester or MCV refills), no idle-unit cap.
+			var external = bot is IBotDecisionBroker broker && broker.ExternalControl;
+
 			// PERF: We shouldn't be queueing new units when we're low on cash
-			if (playerResources.GetCashAndResources() < Info.ProductionMinCashRequirement || requestPause.Any(rp => rp.PauseUnitProduction))
+			if (!external && (playerResources.GetCashAndResources() < Info.ProductionMinCashRequirement || requestPause.Any(rp => rp.PauseUnitProduction)))
 				return;
 
 			ticks++;
@@ -99,12 +103,16 @@ namespace OpenRA.Mods.Common.Traits
 				var buildRequest = queuedBuildRequests.FirstOrDefault();
 				if (buildRequest != null)
 				{
-					queuesByCategory ??= AIUtils.FindQueuesByCategory(player);
-					BuildUnit(bot, buildRequest, queuesByCategory);
+					if (!external)
+					{
+						queuesByCategory ??= AIUtils.FindQueuesByCategory(player);
+						BuildUnit(bot, buildRequest, queuesByCategory);
+					}
+
 					queuedBuildRequests.Remove(buildRequest);
 				}
 
-				if (Info.IdleBaseUnitsMaximum <= 0 || Info.IdleBaseUnitsMaximum > idleUnitCount)
+				if (external || Info.IdleBaseUnitsMaximum <= 0 || Info.IdleBaseUnitsMaximum > idleUnitCount)
 				{
 					queuesByCategory ??= AIUtils.FindQueuesByCategory(player);
 					for (var i = 0; i < Info.UnitQueues.Length; i++)
@@ -146,7 +154,9 @@ namespace OpenRA.Mods.Common.Traits
 			if (queue == null)
 				return;
 
-			var unit = ChooseRandomUnitToBuild(queue);
+			var unit = bot is IBotDecisionBroker broker
+				? broker.DecideProduction(BotDecisionKind.Train, queue, () => ChooseRandomUnitToBuild(queue))
+				: ChooseRandomUnitToBuild(queue);
 
 			if (unit == null)
 				return;
@@ -172,6 +182,10 @@ namespace OpenRA.Mods.Common.Traits
 				if (queue != null)
 					break;
 			}
+
+			// Report requests from other modules (harvester / MCV refills) like any other choice.
+			if (queue != null && bot is IBotDecisionBroker broker)
+				queue = broker.DecideProduction(BotDecisionKind.Train, queue, () => actorInfo) != null ? queue : null;
 
 			if (queue != null)
 			{

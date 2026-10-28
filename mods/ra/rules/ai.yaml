@@ -42,14 +42,14 @@ Player:
 		Condition: enable-naval-ai
 		Bots: naval
 	ResourceMapBotModule:
-		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-easy-ai || enable-medium-ai
+		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-easy-ai || enable-medium-ai || enable-rl-agent
 		ResourceCreatorTypes: mine, gmine
 		ValuableResourceTypes: Ore, Gems
 		HarvesterTypes: harv
 		RefineryTypes: proc
 		EnemyBaseBuildingTypes: pbox,gun,ftur,tsla,agun,barr,tent,weap,afld,hpad,fact,powr,apwr,proc
 	SupportPowerBotModule:
-		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-medium-ai
+		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-medium-ai || enable-rl-agent
 		Decisions:
 			spyplane:
 				OrderName: SovietSpyPlane
@@ -120,7 +120,7 @@ Player:
 		RefineryTypes: proc
 		InitialHarvesters: 2
 	HarvesterBotModule@normal-turtle:
-		RequiresCondition: enable-normal-ai || enable-turtle-ai
+		RequiresCondition: enable-normal-ai || enable-turtle-ai || enable-rl-agent
 		HarvesterTypes: harv
 		RefineryTypes: proc
 		InitialHarvesters: 4
@@ -323,7 +323,7 @@ Player:
 			atek: 11000
 			stek: 11000
 	BaseBuilderBotModule@normal:
-		RequiresCondition: enable-normal-ai
+		RequiresCondition: enable-normal-ai || enable-rl-agent
 		MinimumExcessPower: 0
 		MaximumExcessPower: 200
 		ExcessPowerIncrement: 40
@@ -503,10 +503,10 @@ Player:
 			tsla: 21000
 			kenn: 4000
 	PowerDownBotModule:
-		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-easy-ai || enable-medium-ai
+		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-easy-ai || enable-medium-ai || enable-rl-agent
 		PowerDownTypes: dome,tsla,mslo,agun,sam
 	BuildingRepairBotModule:
-		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-medium-ai
+		RequiresCondition: enable-rush-ai || enable-normal-ai || enable-turtle-ai || enable-naval-ai || enable-medium-ai || enable-rl-agent
 	BuildingRepairBotModule@easy:
 		RequiresCondition: enable-easy-ai
 		RepairAllBuildingsCoolDown: 500
@@ -589,7 +589,7 @@ Player:
 		MoveOldConyardFirst: true
 		MinimumConstructionYardCount: 2
 	McvExpansionManagerBotModule@normal:
-		RequiresCondition: enable-normal-ai
+		RequiresCondition: enable-normal-ai || enable-rl-agent
 		McvTypes: mcv
 		ConstructionYardTypes: fact
 		McvFactoryTypes: weap
@@ -694,7 +694,7 @@ Player:
 			jeep: 4
 			ftrk: 4
 	SquadManagerBotModule@normal:
-		RequiresCondition: enable-normal-ai
+		RequiresCondition: enable-normal-ai || enable-rl-agent
 		SquadSize: 40
 		NavalUnitsTypes: ss, msub, dd, ca, lst, pt
 		ExcludeFromSquadsTypes: harv, mcv, dog, badr.bomber, u2
@@ -707,7 +707,7 @@ Player:
 		ProtectUnitScanRadius: 15
 		ProtectionScanRadius: 12
 	UnitBuilderBotModule@normal:
-		RequiresCondition: enable-normal-ai
+		RequiresCondition: enable-normal-ai || enable-rl-agent
 		UnitsToBuild:
 			e1: 65
 			e2: 15

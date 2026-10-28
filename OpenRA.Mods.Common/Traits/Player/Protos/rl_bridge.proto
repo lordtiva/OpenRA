@@ -80,7 +80,52 @@ message GameObservation {
     string player_slot = 22;
     // SupportPowerManager keys that are Ready (Chronoshift, NukePowerOrder, ...).
     repeated string ready_support_powers = 23;
+
+    // v3 commander: decisions the agent must answer in the next FastAdvance
+    // (brain "external"). Unanswered requests count as "wait".
+    repeated DecisionRequest pending_decisions = 24;
+    // Decisions taken by the built-in bot logic since the last observation
+    // (brain "builtin"): the teacher signal for imitation.
+    repeated TeacherDecision teacher_decisions = 25;
   }
+
+// ─── v3 commander decisions ─────────────────────────────────────────────────
+
+enum DecisionKind {
+  DECISION_NONE = 0;
+  DECIDE_BUILD = 1;   // a structure queue (Building / Defense) is free
+  DECIDE_TRAIN = 2;   // a unit queue (Infantry / Vehicle / ...) is free
+  DECIDE_ARMY = 3;    // periodic: where the main army goes
+}
+
+message TargetCandidate {
+  int32 cell_x = 1;
+  int32 cell_y = 2;
+  string kind = 3;   // "enemy_spawn" | "enemy_building"
+  string type = 4;   // actor type for enemy_building
+}
+
+message DecisionRequest {
+  uint32 id = 1;
+  DecisionKind kind = 2;
+  string queue = 3;                      // BUILD/TRAIN: production queue type
+  repeated string options = 4;           // BUILD/TRAIN: items buildable right now
+  repeated TargetCandidate targets = 5;  // ARMY: attack candidates
+  int32 tick = 6;
+}
+
+message Decision {
+  uint32 request_id = 1;
+  string choice = 2;        // BUILD/TRAIN: one of options; "" = wait
+  // ARMY: -1 = hold (call off the attack, back home), k = attack targets[k].
+  // Leaving an ARMY request unanswered keeps the current orders.
+  int32 target_index = 3;
+}
+
+message TeacherDecision {
+  DecisionRequest request = 1;
+  Decision decision = 2;
+}
 
   message RlGlobalSummary {
         message Side {
@@ -262,6 +307,10 @@ message FastAdvanceRequest {
   // ticking (no second FastAdvance). Empty peer_commands = bot/scripted Multi0.
   repeated Command peer_commands = 6;
   string peer_slot = 7;  // default "Multi0" when peer_commands non-empty
+
+  // v3 commander: answers to the previous observation's pending_decisions.
+  // With brain "external" the advance also stops early when new decisions arise.
+  repeated Decision decisions = 8;
 }
 
 // ─── Session Management (Multi-Session Mode) ────────────────────────────────
@@ -275,6 +324,9 @@ message CreateSessionRequest {
   string player_faction = 4;
   // Empty → Random for scripted/other slots.
   string enemy_faction = 5;
+  // v3 commander brain for the rl-agent slot: "external" (agent decides,
+  // default) or "builtin" (the normal bot logic decides and reports teacher_decisions).
+  string agent_brain = 6;
 }
 
 message CreateSessionResponse {

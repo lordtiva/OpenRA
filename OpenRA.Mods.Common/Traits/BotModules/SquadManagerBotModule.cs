@@ -344,10 +344,14 @@ namespace OpenRA.Mods.Common.Traits
 			foreach (var n in notifyIdleBaseUnits)
 				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
 
+			// An external agent decides when and where the army attacks (RLAttack / RLHold).
+			var external = bot is IBotDecisionBroker broker && broker.ExternalControl;
+
 			if (--rushTicks <= 0)
 			{
 				rushTicks = Info.RushInterval;
-				TryToRushAttack(bot);
+				if (!external)
+					TryToRushAttack(bot);
 			}
 
 			if (--attackForceTicks <= 0)
@@ -375,7 +379,8 @@ namespace OpenRA.Mods.Common.Traits
 			if (--minAttackForceDelayTicks <= 0)
 			{
 				minAttackForceDelayTicks = Info.MinimumAttackForceDelay;
-				CreateAttackForce(bot);
+				if (!external)
+					CreateAttackForce(bot);
 			}
 
 			if (respondToAttackCooldown-- == MaxRespondToAttackCooldown)
@@ -537,6 +542,85 @@ namespace OpenRA.Mods.Common.Traits
 
 			if (protectSq.IsValid && !protectSq.IsTargetValid(protectSq.CenterUnit()))
 				protectSq.SetActorToTarget((attacker, WVec.Zero));
+		}
+
+		// RL commander (IBotDecisionBroker): the agent points the main army, the squad
+		// state machine keeps doing the micro (regroup, attack-move, fuzzy flee).
+
+		/// <summary>Enemy target of the current attack wave, or null if the army is home.</summary>
+		internal Actor RLArmyTarget()
+		{
+			foreach (var s in Squads)
+				if (s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && s.TargetActor != null && !s.TargetActor.IsDead)
+					return s.TargetActor;
+
+			return null;
+		}
+
+		HashSet<Actor> TakeArmy()
+		{
+			CleanSquads();
+			var army = new HashSet<Actor>(unitsHangingAroundTheBase);
+			foreach (var s in Squads)
+				if (s.Type == SquadType.Assault || s.Type == SquadType.Rush)
+					army.UnionWith(s.Units);
+
+			Squads.RemoveAll(s => s.Type == SquadType.Assault || s.Type == SquadType.Rush);
+			army.RemoveWhere(unitCannotBeOrdered);
+			unitsHangingAroundTheBase.Clear();
+			return army;
+		}
+
+		void ReturnToBasePool(IEnumerable<Actor> units)
+		{
+			unitsHangingAroundTheBase.AddRange(units);
+			foreach (var n in notifyIdleBaseUnits)
+				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
+		}
+
+		/// <summary>
+		/// Send every ground unit not protecting the base against the enemy closest to
+		/// <paramref name="cell"/> (within <paramref name="radius"/>). With no enemy there the
+		/// army attack-moves to the cell and stays in the base pool for the next decision.
+		/// </summary>
+		internal void RLAttack(IBot bot, CPos cell, WDist radius)
+		{
+			var army = TakeArmy();
+			if (army.Count == 0)
+				return;
+
+			var pos = World.Map.CenterOfCell(cell);
+			var source = army.MinBy(a => (a.CenterPosition - pos).LengthSquared);
+			var target = FindEnemies(World.FindActorsInCircle(pos, radius), source)
+				.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+
+			if (target.Actor == null)
+			{
+				bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: army.ToArray()));
+				ReturnToBasePool(army);
+				return;
+			}
+
+			var squad = RegisterNewSquad(bot, SquadType.Assault, target);
+			squad.Units.UnionWith(army);
+			foreach (var n in notifyIdleBaseUnits)
+				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
+		}
+
+		/// <summary>Call off any attack wave and bring the army back to the base center.</summary>
+		internal void RLHold(IBot bot)
+		{
+			// Nothing to call off: units at home keep their rally / protection duties.
+			if (!Squads.Any(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush)))
+				return;
+
+			var army = TakeArmy();
+			if (army.Count == 0)
+				return;
+
+			var home = initialBaseCenter != CPos.Zero ? initialBaseCenter : Player.HomeLocation;
+			bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, home), false, groupedActors: army.ToArray()));
+			ReturnToBasePool(army);
 		}
 
 		void IBotPositionsUpdated.UpdatedBaseCenter(CPos newLocation)

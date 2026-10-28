@@ -160,6 +160,8 @@ namespace OpenRA.Mods.Common.Traits
 				if (request.PeerCommands != null && request.PeerCommands.Count > 0)
 					peerCmds = request.PeerCommands;
 
+				bridge.SubmitDecisions(request.Decisions);
+
 				var advanceTask = bridge.RequestFastAdvance(
 					request.Ticks, request.Commands, context.CancellationToken,
 					request.CheckEventsEvery,
@@ -261,7 +263,7 @@ namespace OpenRA.Mods.Common.Traits
 
 			var sessionId = RLSessionManager.CreateSession(
 				request.MapName, request.Bots, request.Seed,
-				request.PlayerFaction, request.EnemyFaction);
+				request.PlayerFaction, request.EnemyFaction, request.AgentBrain);
 
 			return Task.FromResult(new RLProto.CreateSessionResponse
 			{

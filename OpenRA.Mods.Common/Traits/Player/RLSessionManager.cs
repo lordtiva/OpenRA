@@ -256,10 +256,18 @@ namespace OpenRA.Mods.Common.Traits
 		/// the game world is created asynchronously on a background thread.
 		/// FastAdvance will wait for the bridge to activate before proceeding.
 		/// </summary>
+		/// <summary>v3 commander brain per session: "builtin" or "external" (default).</summary>
+		static readonly ConcurrentDictionary<string, string> SessionBrains = new();
+
+		internal static bool IsExternalBrain(string sessionId) =>
+			!SessionBrains.TryGetValue(sessionId ?? "", out var brain) || brain != "builtin";
+
 		public static string CreateSession(string mapName, string bots, int seed,
-			string playerFaction = null, string enemyFaction = null)
+			string playerFaction = null, string enemyFaction = null, string agentBrain = null)
 		{
 			var sessionId = Guid.NewGuid().ToString("N")[..12];
+			if (!string.IsNullOrEmpty(agentBrain))
+				SessionBrains[sessionId] = agentBrain;
 			Log.Write("rl-bridge",
 				$"Creating session {sessionId}: map={mapName}, bots={bots}, seed={seed}, " +
 				$"playerFaction={playerFaction ?? ""}, enemyFaction={enemyFaction ?? ""}");
@@ -451,6 +459,7 @@ namespace OpenRA.Mods.Common.Traits
 			}
 
 			ExternalBotBridge.EarlyWinReasonBySession.TryRemove(sessionId, out _);
+			SessionBrains.TryRemove(sessionId, out _);
 			// Registries already purged; drop poison mark. New CreateSession always
 			// mints a fresh id — no reuse path remains.
 			PoisonedSessions.TryRemove(sessionId, out _);
@@ -521,21 +530,24 @@ namespace OpenRA.Mods.Common.Traits
 				}
 				catch (Exception e)
 				{
-					// Guard/order faults used to abort ProcessOrders mid-frame and
-					// desync EchoConnection → permanent TryTick stall (NO-PROGRESS).
-					// Repair the frame queue and keep going.
+					// A throw inside World.Tick leaves the world half-ticked and the order
+					// pipeline out of step: every later frame fails and orders are dropped.
+					// Never keep playing a corrupted game: poison it so the client sees an error.
 					Console.Error.WriteLine(
 						$"[rl-bridge] TickSession tick-fault session={bridge.SessionId} "
-						+ $"tick={world.WorldTick} paused={world.Paused} "
-						+ $"localFrame={orderManager.LocalFrameNumber} "
-						+ $"netFrame={orderManager.NetFrameNumber}: {e.Message}");
+						+ $"tick={world.WorldTick} localFrame={orderManager.LocalFrameNumber} "
+						+ $"netFrame={orderManager.NetFrameNumber}: {e.Message} — poisoning session");
 					Log.Write("rl-bridge",
 						$"TickSession tick-fault session={bridge.SessionId}: {e}");
-					try { orderManager.RepairEchoPipeline(); }
-					catch (Exception re)
-					{
-						Log.Write("rl-bridge", $"RepairEchoPipeline failed: {re.Message}");
-					}
+					item.Aborted = true;
+					PoisonedSessions[bridge.SessionId] = 0;
+					bridge.FailPendingAdvance($"tick-fault at tick {world.WorldTick}: {e.Message}");
+
+					// Destroy once this worker has released the session (DestroySession waits for it).
+					var faultedId = bridge.SessionId;
+					var reason = $"tick-fault: {e.Message}";
+					ThreadPool.QueueUserWorkItem(_ => PoisonAndDestroy(faultedId, reason));
+					break;
 				}
 
 				tickCount++;

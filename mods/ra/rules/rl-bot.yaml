@@ -7,3 +7,8 @@ Player:
 	ModularBot@DummyAI:
 		Name: Dummy (Passive)
 		Type: dummy
+	# v3 commander: the rl-agent runs the normal AI's bot modules (ai.yaml, || enable-rl-agent);
+	# its strategic choices go through ExternalBotBridge (IBotDecisionBroker).
+	GrantConditionOnBotOwner@rl-agent:
+		Condition: enable-rl-agent
+		Bots: rl-agent

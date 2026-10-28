@@ -55,8 +55,30 @@ namespace OpenRA.Mods.Common.Traits
 		public override object Create(ActorInitializer init) { return new ExternalBotBridge(this, init); }
 	}
 
-	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated
+	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated, INotifyDamage, IBotDecisionBroker
 	{
+		// v3: strategic decisions (BUILD / TRAIN / ARMY) for the bot modules enabled on this player.
+		RLCommander commander;
+
+		bool IBotDecisionBroker.ExternalControl => commander != null && commander.External;
+
+		ActorInfo IBotDecisionBroker.DecideProduction(BotDecisionKind kind, ProductionQueue queue, Func<ActorInfo> nativeChoice)
+		{
+			return commander != null ? commander.DecideProduction(kind, queue, nativeChoice) : nativeChoice();
+		}
+
+		void INotifyDamage.Damaged(Actor self, AttackInfo e)
+		{
+			if (IsEnabled && !self.World.IsLoadingGameSave)
+				commander?.Damaged(self, e);
+		}
+
+		/// <summary>gRPC thread: answers to the previous observation's pending decisions.</summary>
+		internal void SubmitDecisions(IEnumerable<RLProto.Decision> decisions)
+		{
+			commander?.Submit(decisions);
+		}
+
 		/// <summary>
 		/// Thread-safe session registry. In multi-session mode, multiple bridges
 		/// coexist in one process, each identified by its session/episode ID.
@@ -407,6 +429,7 @@ namespace OpenRA.Mods.Common.Traits
 			player = p;
 			observationSerializer = new ObservationSerializer(world, player, episodeId);
 			actionHandler = new ActionHandler(world, player);
+			commander = new RLCommander(this, world, p, RLSessionManager.IsExternalBrain(episodeId));
 
 			// Register in the session registry (primary + per-player for RL-vs-RL).
 			// Prefer Multi1 as Sessions[episodeId] so FastAdvance keeps routing to the learner
@@ -609,9 +632,12 @@ namespace OpenRA.Mods.Common.Traits
 				var gameOverTcs = pendingAdvanceResult;
 				if (gameOverTcs != null)
 				{
+					// Clear before completing: the client may send its next advance at once.
+					pendingAdvanceResult = null;
 					try
 					{
 						var obs = observationSerializer.Serialize(world.WorldTick);
+						commander?.FillObservation(obs);
 						obs.Done = true;
 						obs.Result = player.WinState == WinState.Won ? "win" : "lose";
 						gameOverTcs.TrySetResult(obs);
@@ -621,7 +647,6 @@ namespace OpenRA.Mods.Common.Traits
 						gameOverTcs.TrySetException(e);
 					}
 
-					pendingAdvanceResult = null;
 					pendingFastAdvanceTarget = 0;
 					world.SetTickScale(1.0f);
 				}
@@ -659,6 +684,8 @@ namespace OpenRA.Mods.Common.Traits
 						var earlyTcs = pendingAdvanceResult;
 						if (earlyTcs != null)
 						{
+							// Clear before completing: the client may send its next advance at once.
+							pendingAdvanceResult = null;
 							try
 							{
 								var obsEarly = observationSerializer.Serialize(world.WorldTick);
@@ -670,7 +697,6 @@ namespace OpenRA.Mods.Common.Traits
 							{
 								earlyTcs.TrySetException(e);
 							}
-							pendingAdvanceResult = null;
 							pendingFastAdvanceTarget = 0;
 							world.SetTickScale(1.0f);
 						}
@@ -696,8 +722,9 @@ namespace OpenRA.Mods.Common.Traits
 				var connLostTcs = pendingAdvanceResult;
 				if (connLostTcs != null)
 				{
-					connLostTcs.TrySetCanceled();
+					// Clear before completing: the client may send its next advance at once.
 					pendingAdvanceResult = null;
+					connLostTcs.TrySetCanceled();
 					pendingFastAdvanceTarget = 0;
 					world.SetTickScale(1.0f);
 				}
@@ -739,8 +766,10 @@ namespace OpenRA.Mods.Common.Traits
 				}
 			}
 
-			// Check if fast-forward target tick has been reached (or interrupted)
-			if (pendingFastAdvanceTarget > 0 && world.WorldTick >= pendingFastAdvanceTarget)
+			// Check if fast-forward target tick has been reached (or interrupted, or the
+			// commander needs new decisions from the agent)
+			if (pendingFastAdvanceTarget > 0 && (world.WorldTick >= pendingFastAdvanceTarget
+				|| (commander != null && commander.HasNewRequests)))
 			{
 				world.SetTickScale(1.0f);
 				var reason = pendingInterruptReason;
@@ -754,9 +783,12 @@ namespace OpenRA.Mods.Common.Traits
 				var advTcs = pendingAdvanceResult;
 				if (advTcs != null)
 				{
+					// Clear before completing: the client may send its next advance at once.
+					pendingAdvanceResult = null;
 					try
 					{
 						var obs = observationSerializer.Serialize(world.WorldTick);
+						commander?.FillObservation(obs);
 						// Set interrupt fields
 						if (reason != null)
 						{
@@ -781,7 +813,6 @@ namespace OpenRA.Mods.Common.Traits
 						advTcs.TrySetException(e);
 					}
 
-					pendingAdvanceResult = null;
 					pendingInterruptReason = null;
 				}
 			}
@@ -811,6 +842,8 @@ namespace OpenRA.Mods.Common.Traits
 				Log.Write("rl-bridge", "Agent disconnected (action channel closed)");
 				agentConnected = false;
 			}
+
+			commander?.Tick();
 
 			// Issue any queued orders
 			while (orders.Count > 0)

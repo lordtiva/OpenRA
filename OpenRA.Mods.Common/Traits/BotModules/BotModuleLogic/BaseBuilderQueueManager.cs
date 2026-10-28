@@ -154,11 +154,17 @@ namespace OpenRA.Mods.Common.Traits
 			// Waiting to build something
 			if (currentBuilding == null && failCount < baseBuilder.Info.MaximumFailedPlacementAttempts)
 			{
+				// An external agent decides what to build, regardless of cash.
+				var broker = bot as IBotDecisionBroker;
+				var external = broker != null && broker.ExternalControl;
+
 				// PERF: We shouldn't be queueing new units when we're low on cash
-				if (playerResources.GetCashAndResources() < baseBuilder.Info.ProductionMinCashRequirement || itemQueuedThisTick)
+				if ((!external && playerResources.GetCashAndResources() < baseBuilder.Info.ProductionMinCashRequirement) || itemQueuedThisTick)
 					return false;
 
-				var item = ChooseBuildingToBuild(queue);
+				var item = broker != null
+					? broker.DecideProduction(BotDecisionKind.Build, queue, () => ChooseBuildingToBuild(queue))
+					: ChooseBuildingToBuild(queue);
 				if (item == null)
 					return false;
 
