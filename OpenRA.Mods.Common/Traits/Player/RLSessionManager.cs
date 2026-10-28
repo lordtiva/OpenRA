@@ -134,7 +134,10 @@ namespace OpenRA.Mods.Common.Traits
 			ExternalBotBridge.MultiSessionMode = true;
 			Support.PerfHistory.Disabled = true;
 
-			var workerCount = Environment.ProcessorCount;
+			// Worlds share engine statics, so parallel ticking breaks determinism.
+			// OPENRA_RL_WORKERS=1 ticks sessions one at a time; scale with daemons.
+			var workerCount = int.TryParse(Environment.GetEnvironmentVariable("OPENRA_RL_WORKERS"), out var w) && w > 0
+				? w : Environment.ProcessorCount;
 			workQueue = new BlockingCollection<WorkItem>(boundedCapacity: workerCount * 4);
 			workers = new Thread[workerCount];
 

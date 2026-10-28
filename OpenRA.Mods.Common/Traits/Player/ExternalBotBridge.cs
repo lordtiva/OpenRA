@@ -191,6 +191,10 @@ namespace OpenRA.Mods.Common.Traits
 			// (result="win_early" vs "win") pero mismo w_win para PPO.
 			int earlyWinStreak;
 			const int EarlyWinThreshold = 500;
+
+			// v2 "Capa 0" adjudication (patrimonio / raze rule). Off by default: a win is
+			// the engine's own victory condition; adjudication, if any, belongs to the client.
+			static readonly bool EarlyWinEnabled = Environment.GetEnvironmentVariable("OPENRA_RL_EARLY_WIN") == "1";
 			bool earlyWinDeclared;
 			internal static readonly ConcurrentDictionary<string, string> EarlyWinReasonBySession = new();
 
@@ -634,7 +638,7 @@ namespace OpenRA.Mods.Common.Traits
 			}
 			// ── Capa 0: chequeo win_early cada Tick (500 ticks sostenidos) ─
 			// GUI skirmish vs a human: never steal the match with a patrimonio rule.
-			if (!world.IsGameOver && !earlyWinDeclared && Game.IsHeadless)
+			if (EarlyWinEnabled && !world.IsGameOver && !earlyWinDeclared && Game.IsHeadless)
 			{
 				if (IsEarlyWinConditionMet(out var earlyReason))
 				{
