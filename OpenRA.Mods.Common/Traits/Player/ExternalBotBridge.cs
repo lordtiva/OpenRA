@@ -567,10 +567,13 @@ namespace OpenRA.Mods.Common.Traits
 		/// leave the unary RPC hung until the Python 110s deadline.
 		/// No-op if ITick already completed the TCS.
 		/// </summary>
-		internal void CompletePendingAdvance(string reason)
+		/// <paramref name="only"/>: act only if that is still the pending advance (a worker
+		/// finishing must not complete the client's next advance with zero ticks).
+		internal void CompletePendingAdvance(string reason,
+			TaskCompletionSource<RLProto.GameObservation> only = null)
 		{
 			var tcs = pendingAdvanceResult;
-			if (tcs == null)
+			if (tcs == null || (only != null && tcs != only))
 				return;
 			pendingAdvanceResult = null;
 			pendingFastAdvanceTarget = 0;
@@ -596,10 +599,11 @@ namespace OpenRA.Mods.Common.Traits
 			}
 		}
 
-		internal void FailPendingAdvance(string reason)
+		internal void FailPendingAdvance(string reason,
+			TaskCompletionSource<RLProto.GameObservation> only = null)
 		{
 			var tcs = pendingAdvanceResult;
-			if (tcs == null)
+			if (tcs == null || (only != null && tcs != only))
 				return;
 			pendingAdvanceResult = null;
 			pendingFastAdvanceTarget = 0;
@@ -766,6 +770,42 @@ namespace OpenRA.Mods.Common.Traits
 				}
 			}
 
+			try
+			{
+				// Process all pending actions from agent (non-blocking drain)
+				while (actionChannel.Reader.TryRead(out var agentAction))
+				{
+					// Intercept FAST_ADVANCE before ActionHandler
+					foreach (var cmd in agentAction.Commands)
+					{
+						if (cmd.Action == RLProto.ActionType.FastAdvance)
+						{
+							var ticks = Math.Max(1, Math.Min(cmd.Ticks, 5000));
+							pendingFastAdvanceTarget = world.WorldTick + ticks;
+							world.SetTickScale(0.025f);
+							Log.Write("rl-bridge", $"Fast-forward: {ticks} ticks from {world.WorldTick} to {pendingFastAdvanceTarget} (tickScale=0.025)");
+						}
+					}
+
+					actionHandler.ProcessAction(agentAction, this);
+				}
+			}
+			catch (ChannelClosedException)
+			{
+				Log.Write("rl-bridge", "Agent disconnected (action channel closed)");
+				agentConnected = false;
+			}
+
+			commander?.Tick();
+
+			// Issue any queued orders
+			while (orders.Count > 0)
+				world.IssueOrder(orders.Dequeue());
+
+			// Completed last, after this tick consumed its inputs: the client answers as soon
+			// as the advance completes, and its next commands must land in the next tick,
+			// never in the rest of this one (that raced with wall-clock time and broke
+			// determinism).
 			// Check if fast-forward target tick has been reached (or interrupted, or the
 			// commander needs new decisions from the agent)
 			if (pendingFastAdvanceTarget > 0 && (world.WorldTick >= pendingFastAdvanceTarget
@@ -816,38 +856,6 @@ namespace OpenRA.Mods.Common.Traits
 					pendingInterruptReason = null;
 				}
 			}
-
-			try
-			{
-				// Process all pending actions from agent (non-blocking drain)
-				while (actionChannel.Reader.TryRead(out var agentAction))
-				{
-					// Intercept FAST_ADVANCE before ActionHandler
-					foreach (var cmd in agentAction.Commands)
-					{
-						if (cmd.Action == RLProto.ActionType.FastAdvance)
-						{
-							var ticks = Math.Max(1, Math.Min(cmd.Ticks, 5000));
-							pendingFastAdvanceTarget = world.WorldTick + ticks;
-							world.SetTickScale(0.025f);
-							Log.Write("rl-bridge", $"Fast-forward: {ticks} ticks from {world.WorldTick} to {pendingFastAdvanceTarget} (tickScale=0.025)");
-						}
-					}
-
-					actionHandler.ProcessAction(agentAction, this);
-				}
-			}
-			catch (ChannelClosedException)
-			{
-				Log.Write("rl-bridge", "Agent disconnected (action channel closed)");
-				agentConnected = false;
-			}
-
-			commander?.Tick();
-
-			// Issue any queued orders
-			while (orders.Count > 0)
-				world.IssueOrder(orders.Dequeue());
 
 			// Realtime snapshot (FastAdvance ticks<=0): serialize on this thread
 			// after orders are issued, without changing tickScale.
@@ -1374,7 +1382,7 @@ namespace OpenRA.Mods.Common.Traits
 						$"Session state not found for {episodeId}"));
 				}
 
-				var workItem = RLSessionManager.SubmitWork(state, this);
+				var workItem = RLSessionManager.SubmitWork(state, this, tcs);
 				if (workItem == null)
 					throw new RpcException(new Status(StatusCode.ResourceExhausted,
 						"All worker slots busy, retry later"));

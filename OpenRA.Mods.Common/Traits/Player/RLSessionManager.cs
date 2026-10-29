@@ -20,6 +20,7 @@ using OpenRA.Network;
 using OpenRA.Primitives;
 using OpenRA.Support;
 using OpenRA.Traits;
+using RLProto = OpenRA.Mods.Common.RL;
 
 namespace OpenRA.Mods.Common.Traits
 {
@@ -117,7 +118,21 @@ namespace OpenRA.Mods.Common.Traits
 			public readonly DateTime StartedUtc = DateTime.UtcNow;
 			public volatile bool Aborted;
 
-			public WorkItem(SessionState s, ExternalBotBridge b) { State = s; Bridge = b; }
+			/// <summary>
+			/// The FastAdvance this item serves. The RPC returns as soon as it completes, so
+			/// the next advance can be pending before this worker exits: the worker must stop
+			/// at its own advance and never complete or fail someone else's.
+			/// </summary>
+			public readonly TaskCompletionSource<RLProto.GameObservation> Advance;
+
+			public WorkItem(SessionState s, ExternalBotBridge b, TaskCompletionSource<RLProto.GameObservation> advance)
+			{
+				State = s;
+				Bridge = b;
+				Advance = advance;
+			}
+
+			public bool Served => Advance == null || Advance.Task.IsCompleted;
 		}
 
 		/// <summary>Bounded work queue. If full, FastAdvance returns RESOURCE_EXHAUSTED.</summary>
@@ -170,7 +185,7 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					if (item.Aborted || item.CancelSource.IsCancellationRequested)
 					{
-						item.Bridge.FailPendingAdvance("work cancelled before tick");
+						item.Bridge.FailPendingAdvance("work cancelled before tick", item.Advance);
 						item.Completed.TrySetCanceled();
 						continue;
 					}
@@ -185,7 +200,7 @@ namespace OpenRA.Mods.Common.Traits
 						Log.Write("rl-bridge",
 							$"TickLock timeout 20s session {item.Bridge.SessionId} — "
 							+ $"prior advance likely hung | {FormatActiveSessions()}");
-						item.Bridge.FailPendingAdvance("TickLock timeout 20s");
+						item.Bridge.FailPendingAdvance("TickLock timeout 20s", item.Advance);
 						item.Completed.TrySetException(
 							new TimeoutException("TickLock timeout 20s"));
 						// Isolate: poison the stuck session so GC frees the slot.
@@ -198,9 +213,9 @@ namespace OpenRA.Mods.Common.Traits
 					{
 						TickSession(state, item.Bridge, item);
 						if (item.Aborted || item.CancelSource.IsCancellationRequested)
-							item.Bridge.FailPendingAdvance("worker-aborted");
+							item.Bridge.FailPendingAdvance("worker-aborted", item.Advance);
 						else
-							item.Bridge.CompletePendingAdvance("worker-done");
+							item.Bridge.CompletePendingAdvance("worker-done", item.Advance);
 					}
 					finally
 					{
@@ -233,9 +248,10 @@ namespace OpenRA.Mods.Common.Traits
 		/// Returns the WorkItem so the caller can await completion.
 		/// Throws if the queue is full (RESOURCE_EXHAUSTED).
 		/// </summary>
-		internal static WorkItem SubmitWork(SessionState state, ExternalBotBridge bridge)
+		internal static WorkItem SubmitWork(SessionState state, ExternalBotBridge bridge,
+			TaskCompletionSource<RLProto.GameObservation> advance)
 		{
-			var item = new WorkItem(state, bridge);
+			var item = new WorkItem(state, bridge, advance);
 			if (!workQueue.TryAdd(item, TimeSpan.Zero))
 				return null; // Queue full — caller should return RESOURCE_EXHAUSTED
 
@@ -497,7 +513,7 @@ namespace OpenRA.Mods.Common.Traits
 			var noProgressIterations = 0;
 			const int MaxNoProgressTicks = 50; // bail faster; World.Tick hang still needs poison
 
-			while (!world.IsGameOver && !bridge.SessionDone.IsSet && tickCount < maxTicks)
+			while (!world.IsGameOver && !bridge.SessionDone.IsSet && tickCount < maxTicks && !item.Served)
 			{
 				if (item.Aborted || ct.IsCancellationRequested || DateTime.UtcNow >= deadlineUtc)
 				{
@@ -510,7 +526,7 @@ namespace OpenRA.Mods.Common.Traits
 						+ $"{world.WorldTick} (cancel={ct.IsCancellationRequested}, "
 						+ $"deadline={DateTime.UtcNow >= deadlineUtc}, "
 						+ $"aborted={item.Aborted}) | {FormatActiveSessions()}");
-					bridge.FailPendingAdvance("FastAdvance server deadline / cancel");
+					bridge.FailPendingAdvance("FastAdvance server deadline / cancel", item.Advance);
 					break;
 				}
 
@@ -541,7 +557,7 @@ namespace OpenRA.Mods.Common.Traits
 						$"TickSession tick-fault session={bridge.SessionId}: {e}");
 					item.Aborted = true;
 					PoisonedSessions[bridge.SessionId] = 0;
-					bridge.FailPendingAdvance($"tick-fault at tick {world.WorldTick}: {e.Message}");
+					bridge.FailPendingAdvance($"tick-fault at tick {world.WorldTick}: {e.Message}", item.Advance);
 
 					// Destroy once this worker has released the session (DestroySession waits for it).
 					var faultedId = bridge.SessionId;
@@ -589,7 +605,7 @@ namespace OpenRA.Mods.Common.Traits
 							+ $"netFrame={orderManager.NetFrameNumber}) — releasing worker "
 							+ $"to avoid deadlock | {FormatActiveSessions()}");
 						bridge.FailPendingAdvance(
-							$"NO-PROGRESS {noProgressIterations} at tick {world.WorldTick}");
+							$"NO-PROGRESS {noProgressIterations} at tick {world.WorldTick}", item.Advance);
 						break;
 					}
 				}
@@ -599,9 +615,10 @@ namespace OpenRA.Mods.Common.Traits
 					lastWorldTick = world.WorldTick;
 				}
 
-				// Don't stop while the unary TCS is still pending: a paused
-				// first TryTick or game-over-before-ITick used to drop it.
-				if (!orderManager.IsFastForwarding && !bridge.HasPendingAdvance)
+				// Don't stop while this item's advance is still pending: a paused
+				// first TryTick or game-over-before-ITick used to drop it. Stop as soon
+				// as it is served, even if the client already sent the next one.
+				if (item.Served)
 					break;
 			}
 
@@ -611,7 +628,7 @@ namespace OpenRA.Mods.Common.Traits
 			bridge.CompletePendingAdvance(
 				world.IsGameOver ? "game-over" :
 				tickCount >= maxTicks ? "max-ticks" :
-				"ticksession-exit");
+				"ticksession-exit", item.Advance);
 		}
 
 		/// <summary>

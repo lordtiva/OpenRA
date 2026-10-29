@@ -78,8 +78,11 @@ namespace OpenRA.Mods.Common.Traits
 				ibe.BotEnabled(bot);
 		}
 
-		/// <summary>New requests since the last observation: an external advance stops on them.</summary>
-		public bool HasNewRequests => External && newRequests.Count > 0;
+		/// <summary>
+		/// New requests (external) or teacher decisions (builtin) since the last observation.
+		/// The advance stops on them, so each decision comes with the state it was taken in.
+		/// </summary>
+		public bool HasNewRequests => External ? newRequests.Count > 0 : teacher.Count > 0;
 
 		/// <summary>gRPC thread: answers sent with a FastAdvance (possibly none).</summary>
 		public void Submit(IEnumerable<RLProto.Decision> decisions)
@@ -187,28 +190,6 @@ namespace OpenRA.Mods.Common.Traits
 			var protoKind = kind == BotDecisionKind.Build ? RLProto.DecisionKind.DecideBuild : RLProto.DecisionKind.DecideTrain;
 			var key = $"{protoKind}:{queue.Info.Type}";
 
-			if (!External)
-			{
-				var native = nativeChoice();
-
-				// Waits are reported at most once per WaitTicks, the cadence an external agent sees.
-				if (native == null && waitUntil.TryGetValue(key, out var quiet) && world.WorldTick < quiet)
-					return null;
-
-				var req = NewRequest(protoKind, queue.Info.Type);
-				req.Options.Add(queue.BuildableItems().Select(a => a.Name));
-				teacher.Add(new RLProto.TeacherDecision
-				{
-					Request = req,
-					Decision = new RLProto.Decision { RequestId = req.Id, Choice = native?.Name ?? "" },
-				});
-
-				if (native == null)
-					waitUntil[key] = world.WorldTick + WaitTicks;
-
-				return native;
-			}
-
 			if (requestByKey.ContainsKey(key) || (waitUntil.TryGetValue(key, out var until) && world.WorldTick < until))
 				return null;
 
@@ -218,8 +199,22 @@ namespace OpenRA.Mods.Common.Traits
 
 			var request = NewRequest(protoKind, queue.Info.Type);
 			request.Options.Add(options);
-			Ask(request);
 			requestQueues[request.Id] = queue;
+
+			if (External)
+			{
+				Ask(request);
+				return null;
+			}
+
+			// Builtin: the native choice is answered through the same path as an agent's
+			// (applied when the next step starts), so the teacher decision is paired with
+			// the exact state an external agent would see, before production started.
+			var decision = new RLProto.Decision { RequestId = request.Id, Choice = nativeChoice()?.Name ?? "" };
+			outstanding[request.Id] = request;
+			requestByKey[key] = request.Id;
+			inbox.Enqueue(decision);
+			teacher.Add(new RLProto.TeacherDecision { Request = request, Decision = decision });
 			return null;
 		}
 
