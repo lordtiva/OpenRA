@@ -760,7 +760,10 @@ namespace OpenRA.Mods.Common.Traits
 		internal void RLAttackMain(IBot bot, CPos cell, WDist radius, bool fearless = false)
 		{
 			CleanSquads();
-			var homeUnits = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
+			var orderable = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
+			var homeUnits = !fearless && orderable.Any(a => !a.Info.HasTraitInfo<InfantryInfo>())
+				? orderable.Where(a => !a.Info.HasTraitInfo<InfantryInfo>()).ToList()
+				: orderable;
 			var existingSquads = Squads.Where(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad)).ToList();
 
 			if (homeUnits.Count == 0 && existingSquads.Count == 0)
