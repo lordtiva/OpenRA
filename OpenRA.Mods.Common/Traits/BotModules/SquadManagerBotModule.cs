@@ -711,30 +711,11 @@ namespace OpenRA.Mods.Common.Traits
 				activeUnits.Add(fast);
 			}
 
-			if (rlHarassUnits.Count < MaxHarassUnits)
-			{
-				foreach (var s in Squads)
-				{
-					if ((s.Type != SquadType.Assault && s.Type != SquadType.Rush) || ReferenceEquals(s, rlHarassSquad))
-						continue;
-					var squadFast = s.Units.Where(a => !unitCannotBeOrdered(a) && FastHarassTypes.Contains(a.Info.Name))
-						.OrderBy(a => a.ActorID).ToList();
-					foreach (var fast in squadFast)
-					{
-						if (rlHarassUnits.Count >= MaxHarassUnits || s.Units.Count <= 4)
-							break;
-						s.Units.Remove(fast);
-						rlHarassUnits.Add(fast);
-						activeUnits.Add(fast);
-					}
-				}
-			}
-
-			// Early-game fallback: up to 2 rifle scouts when no fast vehicles exist yet.
+			// Early-game fallback: up to 2 scouts (dogs or rifles) when no fast vehicles exist yet.
 			if (rlHarassUnits.Count == 0 && CountOrderableGroundUnits() >= 5)
 			{
 				var scouts = unitsHangingAroundTheBase
-					.Where(a => !unitCannotBeOrdered(a) && a.Info.Name == "e1")
+					.Where(a => !unitCannotBeOrdered(a) && (a.Info.Name == "e1" || a.Info.Name == "dog"))
 					.OrderBy(a => a.ActorID)
 					.Take(2)
 					.ToList();
