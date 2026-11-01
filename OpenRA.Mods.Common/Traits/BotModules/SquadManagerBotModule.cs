@@ -761,8 +761,8 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			CleanSquads();
 			var orderable = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
-			var homeUnits = !fearless && orderable.Any(a => !a.Info.HasTraitInfo<InfantryInfo>())
-				? orderable.Where(a => !a.Info.HasTraitInfo<InfantryInfo>()).ToList()
+			var homeUnits = !fearless && orderable.Any(a => !a.Info.HasTraitInfo<TakeCoverInfo>())
+				? orderable.Where(a => !a.Info.HasTraitInfo<TakeCoverInfo>()).ToList()
 				: orderable;
 			var existingSquads = Squads.Where(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad)).ToList();
 
