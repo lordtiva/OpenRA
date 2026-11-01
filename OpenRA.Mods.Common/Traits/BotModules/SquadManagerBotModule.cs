@@ -791,8 +791,10 @@ namespace OpenRA.Mods.Common.Traits
 				}
 			}
 
-			// Deploy any idle home units into the attack wave (as their own squad).
-			if (homeUnits.Count > 0)
+			// Deploy any idle home units into the attack wave.
+			// If an attack is already underway, only release reinforcements once a coherent detachment (>= 4 units) has assembled at home,
+			// to prevent feeding single units piecemeal into enemy fire.
+			if (homeUnits.Count >= (existingSquads.Count > 0 ? 4 : 1))
 			{
 				unitsHangingAroundTheBase.RemoveAll(homeUnits.Contains);
 				var squad = RegisterNewSquad(bot, SquadType.Assault, target);
