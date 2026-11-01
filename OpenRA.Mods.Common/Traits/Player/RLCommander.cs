@@ -20,9 +20,9 @@ using RLProto = OpenRA.Mods.Common.RL;
 namespace OpenRA.Mods.Common.Traits
 {
 	/// <summary>
-	/// v3: runs the rl-agent player as a modular bot (the normal AI's modules, enabled for
+	/// v3/v4: runs the rl-agent player as a modular bot (the normal AI's modules, enabled for
 	/// rl-agent in rules) whose strategic decisions come from the agent.
-	/// Brain "external": BUILD / TRAIN / ARMY requests go to the agent through the bridge.
+	/// Brain "external": BUILD / TRAIN / ARMY (MAIN, HARASS, AIR) / SUPPORT requests go to the agent.
 	/// Brain "builtin": the modules' own heuristics decide and are reported as teacher decisions.
 	/// Owned and ticked by <see cref="ExternalBotBridge"/> on the world thread.
 	/// </summary>
@@ -30,16 +30,20 @@ namespace OpenRA.Mods.Common.Traits
 	{
 		// Re-ask a queue this long after "wait" (or an unanswered request).
 		const int WaitTicks = 100;
+		const int SupportWaitTicks = 150;
+		const int SupportCheckInterval = 25;
 		const int ArmyInterval = 250;
-		const int MaxTargets = 12;
+		const int MaxTargets = 16;
+		const int MaxMobileTargets = 4;
 		const int MaxSectorTargets = 4;
+		const int MobileMemoryTicks = 300;
 		const int StaleTicks = 2000;
 		const int DedupCells = 6;
+		const int HarvesterDedupCells = 3;
 		const int ClearedRadius = 10;
 		const int SectorCells = 16;
 		static readonly HashSet<string> GroundTerrain = ["Clear", "Road", "Rough", "Ore", "Gems", "Beach", "Bridge"];
 		static readonly WDist TargetRadius = WDist.FromCells(10);
-		const string ArmyKey = "A";
 
 		public readonly bool External;
 
@@ -56,14 +60,19 @@ namespace OpenRA.Mods.Common.Traits
 
 		readonly Dictionary<uint, RLProto.DecisionRequest> outstanding = [];
 		readonly Dictionary<uint, ProductionQueue> requestQueues = [];
+		readonly Dictionary<uint, string> requestSupportKeys = [];
+		readonly Dictionary<uint, string> requestWaitKeys = [];
 		readonly Dictionary<string, uint> requestByKey = [];
 		readonly Dictionary<string, int> waitUntil = [];
 		readonly List<RLProto.DecisionRequest> newRequests = [];
 		readonly List<RLProto.TeacherDecision> teacher = [];
 		readonly Dictionary<uint, (CPos Cell, string Type)> seenEnemyBuildings = [];
+		readonly Dictionary<uint, (CPos Cell, string Type, int Tick, bool IsHarvester, int Cost)> seenEnemyUnits = [];
 		readonly Dictionary<(int X, int Y), int> sectorLastSeen = [];
+		List<CPos> cachedMapSpawns;
 		uint nextId = 1;
 		int nextArmyTick = ArmyInterval;
+		int nextSupportTick = SupportCheckInterval;
 
 		public RLCommander(IBot bot, World world, Player player, bool external)
 		{
@@ -87,8 +96,9 @@ namespace OpenRA.Mods.Common.Traits
 		/// <summary>gRPC thread: answers sent with a FastAdvance (possibly none).</summary>
 		public void Submit(IEnumerable<RLProto.Decision> decisions)
 		{
-			foreach (var d in decisions)
-				inbox.Enqueue(d);
+			if (decisions != null)
+				foreach (var d in decisions)
+					inbox.Enqueue(d);
 
 			Interlocked.Increment(ref submittedSteps);
 		}
@@ -110,6 +120,7 @@ namespace OpenRA.Mods.Common.Traits
 			});
 
 			TickArmy();
+			TickSupport();
 		}
 
 		public void Damaged(Actor self, AttackInfo e)
@@ -122,13 +133,21 @@ namespace OpenRA.Mods.Common.Traits
 			});
 		}
 
-		/// <summary>Move new requests and teacher decisions into an outgoing observation.</summary>
+		/// <summary>Move new requests, teacher decisions, and v4 metadata into an outgoing observation.</summary>
 		public void FillObservation(RLProto.GameObservation obs)
 		{
 			obs.PendingDecisions.Add(newRequests);
 			newRequests.Clear();
 			obs.TeacherDecisions.Add(teacher);
 			teacher.Clear();
+
+			var squads = Squads();
+			if (squads != null)
+				obs.HarassUnitIds.AddRange(squads.RLHarassActorIds());
+
+			var baseBuilder = BaseBuilder();
+			if (baseBuilder != null)
+				obs.PlacementFailures = baseBuilder.TotalPlacementFailures;
 		}
 
 		void BeginStep()
@@ -138,19 +157,32 @@ namespace OpenRA.Mods.Common.Traits
 				if (!outstanding.Remove(d.RequestId, out var req))
 					continue;
 
+				var wKey = requestWaitKeys.GetValueOrDefault(d.RequestId, KeyOf(req));
 				if (req.Kind == RLProto.DecisionKind.DecideArmy)
-					ApplyArmy(req, d.TargetIndex);
+					ApplyArmy(req, d);
+				else if (req.Kind == RLProto.DecisionKind.DecideSupport)
+				{
+					if (!ApplySupport(req, requestSupportKeys.GetValueOrDefault(d.RequestId), d))
+						waitUntil[wKey] = world.WorldTick + SupportWaitTicks;
+				}
 				else if (!StartProduction(requestQueues.GetValueOrDefault(d.RequestId), d.Choice))
-					waitUntil[KeyOf(req)] = world.WorldTick + WaitTicks;
+					waitUntil[wKey] = world.WorldTick + WaitTicks;
 			}
 
-			// Requests the agent did not answer count as "wait".
+			// Requests the agent did not answer count as "wait" (or "keep" for ARMY).
 			foreach (var req in outstanding.Values)
-				if (req.Kind != RLProto.DecisionKind.DecideArmy)
-					waitUntil[KeyOf(req)] = world.WorldTick + WaitTicks;
+			{
+				var wKey = requestWaitKeys.GetValueOrDefault(req.Id, KeyOf(req));
+				if (req.Kind == RLProto.DecisionKind.DecideSupport)
+					waitUntil[wKey] = world.WorldTick + SupportWaitTicks;
+				else if (req.Kind != RLProto.DecisionKind.DecideArmy)
+					waitUntil[wKey] = world.WorldTick + WaitTicks;
+			}
 
 			outstanding.Clear();
 			requestQueues.Clear();
+			requestSupportKeys.Clear();
+			requestWaitKeys.Clear();
 			requestByKey.Clear();
 		}
 
@@ -170,7 +202,8 @@ namespace OpenRA.Mods.Common.Traits
 
 		static string KeyOf(RLProto.DecisionRequest req)
 		{
-			return req.Kind == RLProto.DecisionKind.DecideArmy ? ArmyKey : $"{req.Kind}:{req.Queue}";
+			var q = req.Kind == RLProto.DecisionKind.DecideArmy && string.IsNullOrEmpty(req.Queue) ? "MAIN" : req.Queue;
+			return $"{req.Kind}:{q}";
 		}
 
 		RLProto.DecisionRequest NewRequest(RLProto.DecisionKind kind, string queue)
@@ -178,10 +211,12 @@ namespace OpenRA.Mods.Common.Traits
 			return new RLProto.DecisionRequest { Id = nextId++, Kind = kind, Queue = queue ?? "", Tick = world.WorldTick };
 		}
 
-		void Ask(RLProto.DecisionRequest req)
+		void Ask(RLProto.DecisionRequest req, string customKey = null)
 		{
+			var key = customKey ?? KeyOf(req);
 			outstanding[req.Id] = req;
-			requestByKey[KeyOf(req)] = req.Id;
+			requestWaitKeys[req.Id] = key;
+			requestByKey[key] = req.Id;
 			newRequests.Add(req);
 		}
 
@@ -203,7 +238,7 @@ namespace OpenRA.Mods.Common.Traits
 
 			if (External)
 			{
-				Ask(request);
+				Ask(request, key);
 				return null;
 			}
 
@@ -212,6 +247,7 @@ namespace OpenRA.Mods.Common.Traits
 			// the exact state an external agent would see, before production started.
 			var decision = new RLProto.Decision { RequestId = request.Id, Choice = nativeChoice()?.Name ?? "" };
 			outstanding[request.Id] = request;
+			requestWaitKeys[request.Id] = key;
 			requestByKey[key] = request.Id;
 			inbox.Enqueue(decision);
 			teacher.Add(new RLProto.TeacherDecision { Request = request, Decision = decision });
@@ -223,29 +259,25 @@ namespace OpenRA.Mods.Common.Traits
 			return player.PlayerActor.TraitsImplementing<SquadManagerBotModule>().FirstOrDefault(m => m.IsTraitEnabled());
 		}
 
-		void TickArmy()
+		BaseBuilderBotModule BaseBuilder()
 		{
-			if (world.WorldTick < nextArmyTick)
-				return;
+			return player.PlayerActor.TraitsImplementing<BaseBuilderBotModule>().FirstOrDefault(m => m.IsTraitEnabled());
+		}
 
-			nextArmyTick = world.WorldTick + ArmyInterval;
-			var squads = Squads();
-			if (squads == null)
-				return;
-
-			UpdateEnemyMemory();
-			var req = NewRequest(RLProto.DecisionKind.DecideArmy, "");
-			req.Targets.Add(BuildTargets());
+		void EmitArmyGroup(string group, List<RLProto.TargetCandidate> targets, SquadManagerBotModule squads)
+		{
+			var req = NewRequest(RLProto.DecisionKind.DecideArmy, group);
+			req.Targets.Add(targets);
+			var key = KeyOf(req);
 
 			if (External)
 			{
-				if (!requestByKey.ContainsKey(ArmyKey))
-					Ask(req);
-
+				if (!requestByKey.ContainsKey(key))
+					Ask(req, key);
 				return;
 			}
 
-			var target = squads.RLArmyTarget();
+			var target = squads.RLArmyTarget(group);
 			var index = -1;
 			if (target != null && req.Targets.Count > 0)
 			{
@@ -269,22 +301,152 @@ namespace OpenRA.Mods.Common.Traits
 			});
 		}
 
-		void ApplyArmy(RLProto.DecisionRequest req, int index)
+		void TickArmy()
+		{
+			if (world.WorldTick < nextArmyTick)
+				return;
+
+			nextArmyTick = world.WorldTick + ArmyInterval;
+			var squads = Squads();
+			if (squads == null)
+				return;
+
+			UpdateEnemyMemory();
+			var targets = BuildTargets();
+
+			EmitArmyGroup("MAIN", targets, squads);
+			if (External && squads.RLCanHarass())
+				EmitArmyGroup("HARASS", targets, squads);
+			if (squads.RLHasAir())
+				EmitArmyGroup("AIR", targets, squads);
+		}
+
+		void TickSupport()
+		{
+			if (!External || world.WorldTick < nextSupportTick)
+				return;
+
+			nextSupportTick = world.WorldTick + SupportCheckInterval;
+			var spm = player.PlayerActor.TraitOrDefault<SupportPowerManager>();
+			if (spm == null || spm.Powers.Count == 0)
+				return;
+
+			List<RLProto.TargetCandidate> targets = null;
+			foreach (var kv in spm.Powers.OrderBy(p => p.Key, StringComparer.Ordinal))
+			{
+				var sp = kv.Value;
+				if (sp == null || sp.Disabled || !sp.Ready)
+					continue;
+
+				var orderName = sp.Info?.OrderName ?? kv.Key;
+				if (orderName.Contains("Gps", StringComparison.OrdinalIgnoreCase))
+					continue;
+
+				var key = $"{RLProto.DecisionKind.DecideSupport}:{kv.Key}";
+				if (requestByKey.ContainsKey(key) || (waitUntil.TryGetValue(key, out var until) && world.WorldTick < until))
+					continue;
+
+				if (targets == null)
+				{
+					UpdateEnemyMemory();
+					targets = BuildTargets();
+				}
+
+				if (targets.Count == 0)
+					continue;
+
+				var req = NewRequest(RLProto.DecisionKind.DecideSupport, orderName);
+				req.Targets.Add(targets);
+				requestSupportKeys[req.Id] = kv.Key;
+				Ask(req, key);
+			}
+		}
+
+		void ApplyArmy(RLProto.DecisionRequest req, RLProto.Decision d)
 		{
 			var squads = Squads();
 			if (squads == null)
 				return;
 
+			var group = string.IsNullOrEmpty(req.Queue) ? "MAIN" : req.Queue;
+			var index = d.TargetIndex;
 			if (index < 0 || index >= req.Targets.Count)
-				squads.RLHold(bot);
+			{
+				squads.RLHoldGroup(bot, group);
+				return;
+			}
+
+			var t = req.Targets[index];
+			var cell = new CPos(t.CellX, t.CellY);
+			if (string.Equals(group, "HARASS", StringComparison.OrdinalIgnoreCase))
+				squads.RLAttackHarass(bot, cell, TargetRadius);
+			else if (string.Equals(group, "AIR", StringComparison.OrdinalIgnoreCase))
+				squads.RLAttackAir(bot, cell, TargetRadius);
 			else
 			{
-				var t = req.Targets[index];
-				squads.RLAttack(bot, new CPos(t.CellX, t.CellY), TargetRadius);
+				var fearless = string.Equals(d.Choice, "all_in", StringComparison.OrdinalIgnoreCase);
+				squads.RLAttackMain(bot, cell, TargetRadius, fearless);
 			}
 		}
 
-		/// <summary>Enemy buildings the agent has seen and not yet seen destroyed (fog memory).</summary>
+		bool ApplySupport(RLProto.DecisionRequest req, string spKey, RLProto.Decision d)
+		{
+			if (d.TargetIndex < 0 || d.TargetIndex >= req.Targets.Count || string.IsNullOrEmpty(spKey))
+				return false;
+
+			var spm = player.PlayerActor.TraitOrDefault<SupportPowerManager>();
+			if (spm == null || !spm.Powers.TryGetValue(spKey, out var sp) || sp == null || sp.Disabled || !sp.Ready)
+				return false;
+
+			var t = req.Targets[d.TargetIndex];
+			var dest = new CPos(t.CellX, t.CellY);
+			if (!world.Map.Contains(dest))
+				return false;
+
+			var orderName = req.Queue ?? sp.Info?.OrderName ?? spKey;
+
+			// Iron Curtain grants invulnerability to friendly armored units; snap destination to our lead combat vehicle.
+			if (orderName.Contains("GrantExternalCondition", StringComparison.OrdinalIgnoreCase))
+			{
+				var ownTank = world.ActorsHavingTrait<Mobile>()
+					.Where(a => a.Owner == player && !a.IsDead && a.IsInWorld
+						&& a.TraitOrDefault<Harvester>() == null
+						&& !string.Equals(a.Info.Name, "mcv", StringComparison.OrdinalIgnoreCase)
+						&& a.Info.HasTraitInfo<AttackBaseInfo>())
+					.OrderByDescending(a => a.Info.TraitInfoOrDefault<ValuedInfo>()?.Cost ?? 0)
+					.ThenBy(a => (a.Location - dest).LengthSquared)
+					.FirstOrDefault();
+				if (ownTank == null)
+					return false;
+				dest = ownTank.Location;
+			}
+
+			var order = new Order(spKey, spm.Self, Target.FromCell(world, dest), false)
+			{
+				SuppressVisualFeedback = true,
+				ExtraData = uint.MaxValue,
+			};
+
+			if (orderName.Contains("Chronoshift", StringComparison.OrdinalIgnoreCase))
+			{
+				var sourceUnit = world.ActorsHavingTrait<Mobile>()
+					.Where(a => a.Owner == player && !a.IsDead && a.IsInWorld
+						&& a.TraitOrDefault<Harvester>() == null
+						&& !string.Equals(a.Info.Name, "mcv", StringComparison.OrdinalIgnoreCase)
+						&& a.Info.HasTraitInfo<AttackBaseInfo>())
+					.OrderByDescending(a => a.Info.TraitInfoOrDefault<ValuedInfo>()?.Cost ?? 0)
+					.ThenBy(a => a.ActorID)
+					.FirstOrDefault();
+				if (sourceUnit == null)
+					return false;
+				order.ExtraLocation = sourceUnit.Location;
+			}
+
+			bot.QueueOrder(order);
+			return true;
+		}
+
+		/// <summary>Enemy buildings and recent mobile units the agent has seen under fog-of-war rules.</summary>
 		void UpdateEnemyMemory()
 		{
 			foreach (var a in world.ActorsHavingTrait<Building>())
@@ -296,57 +458,182 @@ namespace OpenRA.Mods.Common.Traits
 				seenEnemyBuildings[a.ActorID] = (a.Location, a.Info.Name);
 			}
 
-			var gone = new List<uint>();
+			var goneBld = new List<uint>();
 			foreach (var (id, seen) in seenEnemyBuildings)
 			{
 				var a = world.GetActorById(id);
 				if ((a == null || a.IsDead || !a.IsInWorld) && player.Shroud.IsVisible(seen.Cell))
-					gone.Add(id);
+					goneBld.Add(id);
 			}
 
-			foreach (var id in gone)
+			foreach (var id in goneBld)
 				seenEnemyBuildings.Remove(id);
+
+			foreach (var a in world.ActorsHavingTrait<IPositionable>())
+			{
+				if (a.IsDead || !a.IsInWorld || a.Owner == null || a.Owner.NonCombatant
+					|| player.RelationshipWith(a.Owner) != PlayerRelationship.Enemy
+					|| a.Info.HasTraitInfo<BuildingInfo>() || a.Info.HasTraitInfo<HuskInfo>()
+					|| a.Info.HasTraitInfo<AircraftInfo>() || !a.CanBeViewedByPlayer(player))
+					continue;
+
+				var isHarv = a.TraitOrDefault<Harvester>() != null
+					|| string.Equals(a.Info.Name, "harv", StringComparison.OrdinalIgnoreCase);
+				var cost = a.Info.TraitInfoOrDefault<ValuedInfo>()?.Cost ?? 0;
+				if (!isHarv && !a.Info.HasTraitInfo<AttackBaseInfo>() && !string.Equals(a.Info.Name, "mcv", StringComparison.OrdinalIgnoreCase))
+					continue;
+
+				seenEnemyUnits[a.ActorID] = (a.Location, a.Info.Name, world.WorldTick, isHarv, cost);
+			}
+
+			var goneUnits = new List<uint>();
+			foreach (var (id, seen) in seenEnemyUnits)
+			{
+				if (world.WorldTick - seen.Tick > MobileMemoryTicks)
+				{
+					goneUnits.Add(id);
+					continue;
+				}
+
+				var a = world.GetActorById(id);
+				if ((a == null || a.IsDead || !a.IsInWorld) && player.Shroud.IsVisible(seen.Cell))
+					goneUnits.Add(id);
+			}
+
+			foreach (var id in goneUnits)
+				seenEnemyUnits.Remove(id);
+		}
+
+		List<CPos> GetCandidateMapSpawns()
+		{
+			if (cachedMapSpawns != null)
+				return cachedMapSpawns;
+
+			cachedMapSpawns = [];
+			foreach (var n in world.Map.ActorDefinitions)
+			{
+				if (n.Value.Value == "mpspawn")
+				{
+					var cell = new ActorReference(n.Key, n.Value).GetValue<LocationInit, CPos>();
+					if ((cell - player.HomeLocation).LengthSquared > DedupCells * DedupCells)
+						cachedMapSpawns.Add(cell);
+				}
+			}
+
+			// Fallback for synthetic test scenarios that omit mpspawn actor definitions.
+			if (cachedMapSpawns.Count == 0)
+			{
+				foreach (var p in world.Players)
+				{
+					if (!p.NonCombatant && player.RelationshipWith(p) == PlayerRelationship.Enemy
+						&& (p.HomeLocation - player.HomeLocation).LengthSquared > DedupCells * DedupCells)
+						cachedMapSpawns.Add(p.HomeLocation);
+				}
+			}
+
+			var home = player.HomeLocation;
+			cachedMapSpawns.Sort((a, b) =>
+			{
+				var da = (a - home).LengthSquared;
+				var db = (b - home).LengthSquared;
+				var cmp = da.CompareTo(db);
+				if (cmp != 0)
+					return cmp;
+				cmp = a.X.CompareTo(b.X);
+				return cmp != 0 ? cmp : a.Y.CompareTo(b.Y);
+			});
+			return cachedMapSpawns;
 		}
 
 		/// <summary>
-		/// Enemy start locations (until explored and found empty), remembered enemy buildings
-		/// nearest our home, then the nearest mostly-unexplored map sectors (where an enemy
-		/// expansion may hide). Everything here is the agent's own knowledge.
+		/// Map spawn candidates (until explored and found empty), remembered enemy buildings
+		/// nearest our home, recent enemy harvesters / combat columns, and unexplored/stale
+		/// map sectors. 100% fog-honest (never reads enemyPlayer.HomeLocation on standard maps).
 		/// </summary>
 		List<RLProto.TargetCandidate> BuildTargets()
 		{
 			var targets = new List<RLProto.TargetCandidate>();
-			bool TooClose(CPos c) => targets.Any(t => (new CPos(t.CellX, t.CellY) - c).LengthSquared <= DedupCells * DedupCells);
-			bool KnownBuildingNear(CPos c) => seenEnemyBuildings.Values.Any(s => (s.Cell - c).LengthSquared <= ClearedRadius * ClearedRadius);
+			bool TooClose(CPos c, int radius = DedupCells) =>
+				targets.Any(t => (new CPos(t.CellX, t.CellY) - c).LengthSquared <= radius * radius);
+			bool KnownBuildingNear(CPos c) =>
+				seenEnemyBuildings.Values.Any(s => (s.Cell - c).LengthSquared <= ClearedRadius * ClearedRadius);
 
-			foreach (var p in world.Players)
+			foreach (var spawn in GetCandidateMapSpawns())
 			{
-				if (p.NonCombatant || player.RelationshipWith(p) != PlayerRelationship.Enemy || targets.Count >= MaxTargets)
-					continue;
-
-				var spawn = p.HomeLocation;
-				if (!player.Shroud.IsExplored(spawn) || KnownBuildingNear(spawn))
+				if (targets.Count >= MaxTargets)
+					break;
+				if ((!player.Shroud.IsExplored(spawn) || KnownBuildingNear(spawn)) && !TooClose(spawn))
 					targets.Add(new RLProto.TargetCandidate { CellX = spawn.X, CellY = spawn.Y, Kind = "enemy_spawn" });
 			}
 
 			var home = player.HomeLocation;
-			var buildingSlots = MaxTargets - MaxSectorTargets;
-			foreach (var seen in seenEnemyBuildings.Values.OrderBy(s => (s.Cell - home).LengthSquared).ThenBy(s => s.Cell.X).ThenBy(s => s.Cell.Y))
-			{
-				if (targets.Count >= buildingSlots)
-					break;
+			var orderedBuildings = seenEnemyBuildings.Values
+				.OrderBy(s => (s.Cell - home).LengthSquared)
+				.ThenBy(s => s.Cell.X)
+				.ThenBy(s => s.Cell.Y)
+				.ToList();
 
-				if (!TooClose(seen.Cell))
-					targets.Add(new RLProto.TargetCandidate { CellX = seen.Cell.X, CellY = seen.Cell.Y, Kind = "enemy_building", Type = seen.Type });
+			var mobileCandidates = seenEnemyUnits.Values
+				.OrderByDescending(u => u.IsHarvester)
+				.ThenByDescending(u => u.Cost)
+				.ThenBy(u => (u.Cell - home).LengthSquared)
+				.ThenBy(u => u.Cell.X)
+				.ThenBy(u => u.Cell.Y)
+				.ToList();
+
+			var sectors = SectorTargets();
+			var reserveMobile = Math.Min(MaxMobileTargets, mobileCandidates.Count);
+			var reserveSector = Math.Min(MaxSectorTargets, sectors.Count);
+			var buildingCap = Math.Max(0, MaxTargets - reserveMobile - reserveSector);
+
+			var leftoverBuildings = new List<(CPos Cell, string Type)>();
+			foreach (var seen in orderedBuildings)
+			{
+				if (targets.Count < buildingCap)
+				{
+					if (!TooClose(seen.Cell))
+						targets.Add(new RLProto.TargetCandidate { CellX = seen.Cell.X, CellY = seen.Cell.Y, Kind = "enemy_building", Type = seen.Type });
+				}
+				else
+					leftoverBuildings.Add(seen);
 			}
 
-			foreach (var (cell, kind) in SectorTargets())
+			var addedMobile = 0;
+			foreach (var mob in mobileCandidates)
+			{
+				if (addedMobile >= MaxMobileTargets || targets.Count >= MaxTargets - reserveSector)
+					break;
+
+				var dedup = mob.IsHarvester ? HarvesterDedupCells : DedupCells;
+				if (!TooClose(mob.Cell, dedup))
+				{
+					targets.Add(new RLProto.TargetCandidate
+					{
+						CellX = mob.Cell.X,
+						CellY = mob.Cell.Y,
+						Kind = mob.IsHarvester ? "enemy_harvester" : "enemy_mobile",
+						Type = mob.Type,
+					});
+					addedMobile++;
+				}
+			}
+
+			foreach (var (cell, kind) in sectors)
 			{
 				if (targets.Count >= MaxTargets)
 					break;
 
 				if (!TooClose(cell))
 					targets.Add(new RLProto.TargetCandidate { CellX = cell.X, CellY = cell.Y, Kind = kind });
+			}
+
+			foreach (var seen in leftoverBuildings)
+			{
+				if (targets.Count >= MaxTargets)
+					break;
+
+				if (!TooClose(seen.Cell))
+					targets.Add(new RLProto.TargetCandidate { CellX = seen.Cell.X, CellY = seen.Cell.Y, Kind = "enemy_building", Type = seen.Type });
 			}
 
 			return targets;

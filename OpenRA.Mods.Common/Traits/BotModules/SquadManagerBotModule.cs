@@ -126,6 +126,12 @@ namespace OpenRA.Mods.Common.Traits
 		// Units that the bot already knows about. Any unit not on this list needs to be given a role.
 		readonly HashSet<Actor> activeUnits = [];
 
+		// v4 tactical groups: independent fast scout/harass detachment kept separate from MAIN.
+		static readonly FrozenSet<string> FastHarassTypes = new HashSet<string> { "jeep", "1tnk", "ftrk", "apc" }.ToFrozenSet();
+		const int MaxHarassUnits = 4;
+		readonly HashSet<Actor> rlHarassUnits = [];
+		Squad rlHarassSquad;
+
 		public List<Squad> Squads = [];
 		readonly Stack<Squad> squadsPendingUpdate = [];
 		readonly ActorIndex.NamesAndTrait<BuildingInfo> constructionYardBuildings;
@@ -310,6 +316,9 @@ namespace OpenRA.Mods.Common.Traits
 			foreach (var s in Squads)
 				s.Units.RemoveWhere(unitCannotBeOrdered);
 			Squads.RemoveAll(s => !s.IsValid);
+			rlHarassUnits.RemoveWhere(unitCannotBeOrdered);
+			if (rlHarassSquad != null && (!rlHarassSquad.IsValid || !Squads.Contains(rlHarassSquad)))
+				rlHarassSquad = null;
 		}
 
 		// HACK: Use of this function requires that there is one squad of this type.
@@ -327,6 +336,15 @@ namespace OpenRA.Mods.Common.Traits
 
 		internal void UnregisterSquad(Squad squad)
 		{
+			if (ReferenceEquals(squad, rlHarassSquad))
+			{
+				rlHarassUnits.RemoveWhere(unitCannotBeOrdered);
+				activeUnits.UnionWith(rlHarassUnits);
+				squad.Units.Clear();
+				rlHarassSquad = null;
+				return;
+			}
+
 			activeUnits.ExceptWith(squad.Units);
 			squad.Units.Clear();
 
@@ -544,31 +562,192 @@ namespace OpenRA.Mods.Common.Traits
 				protectSq.SetActorToTarget((attacker, WVec.Zero));
 		}
 
-		// RL commander (IBotDecisionBroker): the agent points the main army, the squad
-		// state machine keeps doing the micro (regroup, attack-move, fuzzy flee).
+		// RL commander (IBotDecisionBroker): v4 supports three tactical groups:
+		//   - MAIN: main ground battleforce (normal micro or fearless all_in push)
+		//   - HARASS: up to MaxHarassUnits fast scouts/raiders excluded from MAIN
+		//   - AIR: helicopters / fixed-wing aircraft (SquadType.Air)
 
-		/// <summary>Enemy target of the current attack wave, or null if the army is home.</summary>
-		internal Actor RLArmyTarget()
+		internal IEnumerable<uint> RLHarassActorIds()
 		{
+			CleanSquads();
+			return rlHarassUnits.Select(a => a.ActorID).OrderBy(id => id);
+		}
+
+		int CountOrderableGroundUnits()
+		{
+			var seen = new HashSet<Actor>();
+			foreach (var a in unitsHangingAroundTheBase)
+				if (!unitCannotBeOrdered(a) && !Info.AirUnitsTypes.Contains(a.Info.Name) && !Info.NavalUnitsTypes.Contains(a.Info.Name))
+					seen.Add(a);
+			foreach (var a in rlHarassUnits)
+				if (!unitCannotBeOrdered(a))
+					seen.Add(a);
 			foreach (var s in Squads)
-				if (s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && s.TargetActor != null && !s.TargetActor.IsDead)
+			{
+				if (s.Type == SquadType.Air || s.Type == SquadType.Naval)
+					continue;
+				foreach (var a in s.Units)
+					if (!unitCannotBeOrdered(a))
+						seen.Add(a);
+			}
+
+			return seen.Count;
+		}
+
+		internal bool RLCanHarass()
+		{
+			CleanSquads();
+			if (rlHarassUnits.Count > 0)
+				return true;
+
+			if (unitsHangingAroundTheBase.Any(a => !unitCannotBeOrdered(a) && FastHarassTypes.Contains(a.Info.Name)))
+				return true;
+
+			foreach (var s in Squads)
+			{
+				if ((s.Type == SquadType.Assault || s.Type == SquadType.Rush)
+					&& s.Units.Count > 4
+					&& s.Units.Any(a => !unitCannotBeOrdered(a) && FastHarassTypes.Contains(a.Info.Name)))
+					return true;
+			}
+
+			return CountOrderableGroundUnits() >= 5
+				&& unitsHangingAroundTheBase.Any(a => !unitCannotBeOrdered(a) && a.Info.Name == "e1");
+		}
+
+		Squad SyncAirSquad(IBot bot)
+		{
+			CleanSquads();
+			var airActors = World.ActorsHavingTrait<IPositionable>()
+				.Where(a => a.Owner == Player && !unitCannotBeOrdered(a) && Info.AirUnitsTypes.Contains(a.Info.Name))
+				.OrderBy(a => a.ActorID)
+				.ToList();
+			if (airActors.Count == 0)
+				return null;
+
+			var air = GetSquadOfType(SquadType.Air);
+			air ??= RegisterNewSquad(bot, SquadType.Air);
+			foreach (var a in airActors)
+			{
+				air.Units.Add(a);
+				activeUnits.Add(a);
+			}
+
+			return air.IsValid ? air : null;
+		}
+
+		internal bool RLHasAir()
+		{
+			CleanSquads();
+			return World.ActorsHavingTrait<IPositionable>()
+				.Any(a => a.Owner == Player && !unitCannotBeOrdered(a) && Info.AirUnitsTypes.Contains(a.Info.Name));
+		}
+
+		/// <summary>Enemy target of the specified tactical group, or null if idle/home.</summary>
+		internal Actor RLArmyTarget(string group = "MAIN")
+		{
+			CleanSquads();
+			if (string.Equals(group, "HARASS", StringComparison.OrdinalIgnoreCase))
+				return rlHarassSquad != null && rlHarassSquad.IsValid && rlHarassSquad.TargetActor != null && !rlHarassSquad.TargetActor.IsDead
+					? rlHarassSquad.TargetActor : null;
+
+			if (string.Equals(group, "AIR", StringComparison.OrdinalIgnoreCase))
+			{
+				var air = GetSquadOfType(SquadType.Air);
+				return air != null && air.IsValid && air.TargetActor != null && !air.TargetActor.IsDead
+					? air.TargetActor : null;
+			}
+
+			foreach (var s in Squads)
+				if (s.IsValid && !ReferenceEquals(s, rlHarassSquad)
+					&& (s.Type == SquadType.Assault || s.Type == SquadType.Rush)
+					&& s.TargetActor != null && !s.TargetActor.IsDead)
 					return s.TargetActor;
 
 			return null;
 		}
 
-		HashSet<Actor> TakeArmy()
+		HashSet<Actor> TakeMainArmy()
 		{
 			CleanSquads();
-			var army = new HashSet<Actor>(unitsHangingAroundTheBase);
+			var army = new HashSet<Actor>(unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a)));
 			foreach (var s in Squads)
-				if (s.Type == SquadType.Assault || s.Type == SquadType.Rush)
-					army.UnionWith(s.Units);
+				if ((s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad))
+					army.UnionWith(s.Units.Where(a => !rlHarassUnits.Contains(a)));
 
-			Squads.RemoveAll(s => s.Type == SquadType.Assault || s.Type == SquadType.Rush);
+			Squads.RemoveAll(s => (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad));
 			army.RemoveWhere(unitCannotBeOrdered);
-			unitsHangingAroundTheBase.Clear();
+			unitsHangingAroundTheBase.RemoveAll(a => !rlHarassUnits.Contains(a));
 			return army;
+		}
+
+		void RecruitHarassUnits()
+		{
+			CleanSquads();
+			unitsHangingAroundTheBase.RemoveAll(rlHarassUnits.Contains);
+
+			// Upgrade rifle scouts to fast vehicles once vehicles are available at home.
+			var idleFast = unitsHangingAroundTheBase
+				.Where(a => !unitCannotBeOrdered(a) && FastHarassTypes.Contains(a.Info.Name))
+				.OrderBy(a => a.ActorID)
+				.ToList();
+			if (idleFast.Count > 0 && rlHarassUnits.Any(a => !FastHarassTypes.Contains(a.Info.Name)))
+			{
+				var demoted = rlHarassUnits.Where(a => !FastHarassTypes.Contains(a.Info.Name)).OrderBy(a => a.ActorID).ToList();
+				foreach (var d in demoted)
+				{
+					rlHarassUnits.Remove(d);
+					rlHarassSquad?.Units.Remove(d);
+					unitsHangingAroundTheBase.Add(d);
+				}
+			}
+
+			foreach (var fast in idleFast)
+			{
+				if (rlHarassUnits.Count >= MaxHarassUnits)
+					break;
+				unitsHangingAroundTheBase.Remove(fast);
+				rlHarassUnits.Add(fast);
+				activeUnits.Add(fast);
+			}
+
+			if (rlHarassUnits.Count < MaxHarassUnits)
+			{
+				foreach (var s in Squads)
+				{
+					if ((s.Type != SquadType.Assault && s.Type != SquadType.Rush) || ReferenceEquals(s, rlHarassSquad))
+						continue;
+					var squadFast = s.Units.Where(a => !unitCannotBeOrdered(a) && FastHarassTypes.Contains(a.Info.Name))
+						.OrderBy(a => a.ActorID).ToList();
+					foreach (var fast in squadFast)
+					{
+						if (rlHarassUnits.Count >= MaxHarassUnits || s.Units.Count <= 4)
+							break;
+						s.Units.Remove(fast);
+						rlHarassUnits.Add(fast);
+						activeUnits.Add(fast);
+					}
+				}
+			}
+
+			// Early-game fallback: up to 2 rifle scouts when no fast vehicles exist yet.
+			if (rlHarassUnits.Count == 0 && CountOrderableGroundUnits() >= 5)
+			{
+				var scouts = unitsHangingAroundTheBase
+					.Where(a => !unitCannotBeOrdered(a) && a.Info.Name == "e1")
+					.OrderBy(a => a.ActorID)
+					.Take(2)
+					.ToList();
+				foreach (var sc in scouts)
+				{
+					unitsHangingAroundTheBase.Remove(sc);
+					rlHarassUnits.Add(sc);
+					activeUnits.Add(sc);
+				}
+			}
+
+			foreach (var n in notifyIdleBaseUnits)
+				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
 		}
 
 		void ReturnToBasePool(IEnumerable<Actor> units)
@@ -578,14 +757,9 @@ namespace OpenRA.Mods.Common.Traits
 				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
 		}
 
-		/// <summary>
-		/// Send every ground unit not protecting the base against the enemy closest to
-		/// <paramref name="cell"/> (within <paramref name="radius"/>). With no enemy there the
-		/// army attack-moves to the cell and stays in the base pool for the next decision.
-		/// </summary>
-		internal void RLAttack(IBot bot, CPos cell, WDist radius)
+		internal void RLAttackMain(IBot bot, CPos cell, WDist radius, bool fearless = false)
 		{
-			var army = TakeArmy();
+			var army = TakeMainArmy();
 			if (army.Count == 0)
 				return;
 
@@ -602,26 +776,140 @@ namespace OpenRA.Mods.Common.Traits
 			}
 
 			var squad = RegisterNewSquad(bot, SquadType.Assault, target);
+			squad.Fearless = fearless;
 			squad.Units.UnionWith(army);
 			foreach (var n in notifyIdleBaseUnits)
 				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
 		}
 
-		/// <summary>Call off any attack wave and bring the army back to the base center.</summary>
-		internal void RLHold(IBot bot)
+		internal void RLAttack(IBot bot, CPos cell, WDist radius) => RLAttackMain(bot, cell, radius, false);
+
+		internal void RLAttackHarass(IBot bot, CPos cell, WDist radius)
 		{
-			// Nothing to call off: units at home keep their rally / protection duties.
-			if (!Squads.Any(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush)))
+			RecruitHarassUnits();
+			if (rlHarassUnits.Count == 0)
 				return;
 
-			var army = TakeArmy();
+			if (rlHarassSquad != null)
+			{
+				Squads.Remove(rlHarassSquad);
+				rlHarassSquad = null;
+			}
+
+			var units = rlHarassUnits.OrderBy(a => a.ActorID).ToArray();
+			var pos = World.Map.CenterOfCell(cell);
+			var source = units.MinBy(a => (a.CenterPosition - pos).LengthSquared);
+			var visibleCandidates = World.FindActorsInCircle(pos, radius)
+				.Where(a => IsPreferredEnemyUnit(a) && (a.CanBeViewedByPlayer(Player)
+					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))));
+			var target = FindEnemies(visibleCandidates, source)
+				.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+
+			if (target.Actor == null)
+			{
+				// Keep units in rlHarassUnits so MAIN never yanks them back mid-scout!
+				activeUnits.UnionWith(rlHarassUnits);
+				bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: units));
+				return;
+			}
+
+			rlHarassSquad = RegisterNewSquad(bot, SquadType.Rush, target);
+			rlHarassSquad.Units.UnionWith(units);
+			activeUnits.UnionWith(rlHarassUnits);
+		}
+
+		internal void RLAttackAir(IBot bot, CPos cell, WDist radius)
+		{
+			var air = SyncAirSquad(bot);
+			if (air == null || !air.IsValid)
+				return;
+
+			var units = air.Units.OrderBy(a => a.ActorID).ToArray();
+			var pos = World.Map.CenterOfCell(cell);
+			var source = units.MinBy(a => (a.CenterPosition - pos).LengthSquared);
+			var candidates = World.FindActorsInCircle(pos, radius)
+				.Where(a => IsPreferredEnemyUnit(a) && (a.CanBeViewedByPlayer(Player)
+					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))));
+			var target = FindEnemies(candidates, source)
+				.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+
+			if (target.Actor != null)
+			{
+				air.SetActorToTarget(target);
+				air.FuzzyStateMachine.ChangeState(air, new AirAttackState());
+				air.Update();
+				return;
+			}
+
+			// Aerial reconnaissance over fogged/unexplored sector
+			air.SetActorToTarget(default);
+			air.FuzzyStateMachine.ChangeState(air, new AirIdleState());
+			foreach (var a in units)
+			{
+				var ammoPools = a.TraitsImplementing<AmmoPool>().ToArray();
+				if (ammoPools.Length > 0 && ammoPools.All(ap => ap.CurrentAmmoCount == 0) && a.TraitOrDefault<Rearmable>() != null)
+					bot.QueueOrder(new Order("ReturnToBase", a, false));
+				else
+					bot.QueueOrder(new Order("Move", a, Target.FromCell(World, cell), false));
+			}
+		}
+
+		internal void RLHoldGroup(IBot bot, string group)
+		{
+			var home = initialBaseCenter != CPos.Zero ? initialBaseCenter : Player.HomeLocation;
+
+			if (string.Equals(group, "HARASS", StringComparison.OrdinalIgnoreCase))
+			{
+				CleanSquads();
+				if (rlHarassSquad != null)
+				{
+					Squads.Remove(rlHarassSquad);
+					rlHarassSquad = null;
+				}
+
+				if (rlHarassUnits.Count == 0)
+					return;
+
+				var units = rlHarassUnits.OrderBy(a => a.ActorID).ToArray();
+				rlHarassUnits.Clear();
+				bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, home), false, groupedActors: units));
+				ReturnToBasePool(units);
+				return;
+			}
+
+			if (string.Equals(group, "AIR", StringComparison.OrdinalIgnoreCase))
+			{
+				var air = GetSquadOfType(SquadType.Air);
+				if (air == null || !air.IsValid)
+					return;
+
+				air.SetActorToTarget(default);
+				air.FuzzyStateMachine.ChangeState(air, new AirIdleState());
+				foreach (var a in air.Units.OrderBy(u => u.ActorID))
+				{
+					if (a.TraitOrDefault<Rearmable>() != null)
+						bot.QueueOrder(new Order("ReturnToBase", a, false));
+					else
+						bot.QueueOrder(new Order("Move", a, Target.FromCell(World, home), false));
+				}
+
+				return;
+			}
+
+			// MAIN group
+			if (!Squads.Any(s => s.IsValid && !ReferenceEquals(s, rlHarassSquad) && (s.Type == SquadType.Assault || s.Type == SquadType.Rush)))
+				return;
+
+			var army = TakeMainArmy();
 			if (army.Count == 0)
 				return;
 
-			var home = initialBaseCenter != CPos.Zero ? initialBaseCenter : Player.HomeLocation;
 			bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, home), false, groupedActors: army.ToArray()));
 			ReturnToBasePool(army);
 		}
+
+		/// <summary>Call off any main attack wave and bring the army back to the base center.</summary>
+		internal void RLHold(IBot bot) => RLHoldGroup(bot, "MAIN");
 
 		void IBotPositionsUpdated.UpdatedBaseCenter(CPos newLocation)
 		{

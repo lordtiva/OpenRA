@@ -429,7 +429,7 @@ namespace OpenRA.Mods.Common.Traits
 			player = p;
 			observationSerializer = new ObservationSerializer(world, player, episodeId);
 			actionHandler = new ActionHandler(world, player);
-			commander = new RLCommander(this, world, p, RLSessionManager.IsExternalBrain(episodeId));
+			commander = new RLCommander(this, world, p, RLSessionManager.IsExternalBrain(episodeId, p.InternalName));
 
 			// Register in the session registry (primary + per-player for RL-vs-RL).
 			// Prefer Multi1 as Sessions[episodeId] so FastAdvance keeps routing to the learner
@@ -560,12 +560,166 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		internal bool HasPendingAdvance => pendingAdvanceResult != null;
+		internal bool HasNewCommanderRequests => commander != null && commander.HasNewRequests;
+
+		internal ExternalBotBridge FindPeerBridge()
+		{
+			if (string.IsNullOrEmpty(episodeId))
+				return null;
+
+			if (PlayerSessions.TryGetValue(PlayerKey(episodeId, "Multi0"), out var m0)
+				&& m0 != null && m0.IsEnabled && !ReferenceEquals(m0, this))
+				return m0;
+
+			var prefix = episodeId + "|";
+			foreach (var kvp in PlayerSessions)
+			{
+				if (kvp.Key.StartsWith(prefix, StringComparison.Ordinal)
+					&& kvp.Value != null && kvp.Value.IsEnabled
+					&& !ReferenceEquals(kvp.Value, this))
+					return kvp.Value;
+			}
+
+			return null;
+		}
+
+		internal RLProto.GameObservation SerializePeerStepObservation(int actualTicksAdvanced)
+		{
+			var obs = observationSerializer.Serialize(world.WorldTick);
+			commander?.FillObservation(obs);
+			obs.ActualTicksAdvanced = actualTicksAdvanced;
+			if (world.IsGameOver)
+			{
+				obs.Done = true;
+				if (EarlyWinReasonBySession.ContainsKey(episodeId))
+					obs.Result = player != null && player.WinState == WinState.Won ? "win_early" : "lose";
+				else
+					obs.Result = player != null && player.WinState == WinState.Won ? "win"
+						: player != null && player.WinState == WinState.Lost ? "lose"
+						: "draw";
+			}
+
+			return obs;
+		}
+
+		RLProto.GameObservation BuildStepObservation(string interruptReason, ExternalBotBridge peer)
+		{
+			var obs = observationSerializer.Serialize(world.WorldTick);
+			commander?.FillObservation(obs);
+			if (interruptReason != null)
+			{
+				obs.Interrupted = true;
+				obs.InterruptReason = interruptReason;
+			}
+
+			obs.ActualTicksAdvanced = world.WorldTick - fastAdvanceStartTick;
+			if (world.IsGameOver)
+			{
+				obs.Done = true;
+				if (EarlyWinReasonBySession.ContainsKey(episodeId))
+					obs.Result = player != null && player.WinState == WinState.Won ? "win_early" : "lose";
+				else
+					obs.Result = player != null && player.WinState == WinState.Won ? "win"
+						: player != null && player.WinState == WinState.Lost ? "lose"
+						: "draw";
+			}
+
+			if (peer != null)
+				obs.PeerObservation = peer.SerializePeerStepObservation(obs.ActualTicksAdvanced);
+
+			return obs;
+		}
+
+		/// <summary>
+		/// End-of-WorldTick lock-step completion for MultiSessionMode: runs AFTER all
+		/// players (Multi1 and Multi0) have completed ITick + commander.Tick() + IssueOrder
+		/// for this WorldTick, eliminating player-order races and returning both observations
+		/// in a single FastAdvance response.
+		/// </summary>
+		internal void PostWorldTick()
+		{
+			if (!MultiSessionMode || !IsEnabled)
+				return;
+
+			var peer = FindPeerBridge();
+
+			if (!gameOverHandled && world.IsGameOver)
+			{
+				gameOverHandled = true;
+				Log.Write("rl-bridge", $"Game over detected at tick {world.WorldTick}, session {episodeId}");
+				var gameOverTcs = pendingAdvanceResult;
+				if (gameOverTcs != null)
+				{
+					pendingAdvanceResult = null;
+					pendingFastAdvanceTarget = 0;
+					pendingInterruptReason = null;
+					world.SetTickScale(1.0f);
+					try
+					{
+						var obs = BuildStepObservation(null, peer);
+						gameOverTcs.TrySetResult(obs);
+					}
+					catch (Exception e)
+					{
+						gameOverTcs.TrySetException(e);
+					}
+				}
+
+				peer?.Deactivate();
+				Deactivate();
+				return;
+			}
+
+			if (!connectionLostHandled && !world.IsConnectionAlive)
+			{
+				connectionLostHandled = true;
+				Log.Write("rl-bridge", $"Internal connection lost at tick {world.WorldTick}! Session {episodeId}.");
+				var connLostTcs = pendingAdvanceResult;
+				if (connLostTcs != null)
+				{
+					pendingAdvanceResult = null;
+					pendingFastAdvanceTarget = 0;
+					world.SetTickScale(1.0f);
+					connLostTcs.TrySetCanceled();
+				}
+
+				peer?.Deactivate();
+				Deactivate();
+				return;
+			}
+
+			if (pendingFastAdvanceTarget > 0 && (world.WorldTick >= pendingFastAdvanceTarget
+				|| pendingInterruptReason != null
+				|| HasNewCommanderRequests
+				|| (peer != null && peer.HasNewCommanderRequests)))
+			{
+				world.SetTickScale(1.0f);
+				var reason = pendingInterruptReason;
+				pendingInterruptReason = null;
+				pendingFastAdvanceTarget = 0;
+
+				var advTcs = pendingAdvanceResult;
+				if (advTcs != null)
+				{
+					pendingAdvanceResult = null;
+					try
+					{
+						var obs = BuildStepObservation(reason, peer);
+						advTcs.TrySetResult(obs);
+					}
+					catch (Exception e)
+					{
+						advTcs.TrySetException(e);
+					}
+				}
+			}
+		}
 
 		/// <summary>
 		/// TickSession / worker must never finish while FastAdvance is still
 		/// waiting: a paused first TryTick or game-over-before-ITick used to
 		/// leave the unary RPC hung until the Python 110s deadline.
-		/// No-op if ITick already completed the TCS.
+		/// No-op if PostWorldTick / ITick already completed the TCS.
 		/// </summary>
 		/// <paramref name="only"/>: act only if that is still the pending advance (a worker
 		/// finishing must not complete the client's next advance with zero ticks).
@@ -581,13 +735,8 @@ namespace OpenRA.Mods.Common.Traits
 			try { world.SetTickScale(1.0f); } catch { /* world may be disposing */ }
 			try
 			{
-				var obs = observationSerializer.Serialize(world.WorldTick);
-				if (world.IsGameOver)
-				{
-					obs.Done = true;
-					obs.Result = player != null && player.WinState == WinState.Won ? "win" : "lose";
-				}
-
+				var peer = FindPeerBridge();
+				var obs = BuildStepObservation(null, peer);
 				Log.Write("rl-bridge",
 					$"CompletePendingAdvance ({reason}) tick={world.WorldTick} session={episodeId}");
 				tcs.TrySetResult(obs);
@@ -625,8 +774,10 @@ namespace OpenRA.Mods.Common.Traits
 			if (!IsEnabled || self.World.IsLoadingGameSave)
 				return;
 
-			// Detect game over in Tick (IGameOver.GameOver doesn't fire on Player traits)
-			if (!gameOverHandled && world.IsGameOver)
+			// Detect game over in Tick (IGameOver.GameOver doesn't fire on Player traits).
+			// In MultiSessionMode, PostWorldTick() handles game-over after ALL player actors
+			// finish ITick for this WorldTick.
+			if (!MultiSessionMode && !gameOverHandled && world.IsGameOver)
 			{
 				gameOverHandled = true;
 				Log.Write("rl-bridge", $"Game over detected at tick {world.WorldTick}, session {episodeId}");
@@ -655,15 +806,7 @@ namespace OpenRA.Mods.Common.Traits
 					world.SetTickScale(1.0f);
 				}
 
-				if (MultiSessionMode)
-				{
-					// In multi-session mode, just deactivate — don't exit the process
-					Deactivate();
-				}
-				else
-				{
-					ScheduleProcessExit("game over", 3000);
-				}
+				ScheduleProcessExit("game over", 3000);
 			}
 			// ── Capa 0: chequeo win_early cada Tick (500 ticks sostenidos) ─
 			// GUI skirmish vs a human: never steal the match with a patrimonio rule.
@@ -685,6 +828,9 @@ namespace OpenRA.Mods.Common.Traits
 						if (enemyPlayer != null)
 							world.OnPlayerWinStateChanged(enemyPlayer);
 						world.EndGame();
+						if (MultiSessionMode)
+							return;
+
 						var earlyTcs = pendingAdvanceResult;
 						if (earlyTcs != null)
 						{
@@ -705,10 +851,7 @@ namespace OpenRA.Mods.Common.Traits
 							world.SetTickScale(1.0f);
 						}
 						gameOverHandled = true;
-						if (MultiSessionMode)
-							Deactivate();
-						else
-							ScheduleProcessExit("win_early", 3000);
+						ScheduleProcessExit("win_early", 3000);
 						return;
 					}
 				}
@@ -719,6 +862,9 @@ namespace OpenRA.Mods.Common.Traits
 			// Detect internal connection loss (TCP between client and embedded server)
 			if (!connectionLostHandled && !world.IsConnectionAlive)
 			{
+				if (MultiSessionMode)
+					return;
+
 				connectionLostHandled = true;
 				Log.Write("rl-bridge", $"Internal connection lost at tick {world.WorldTick}! Session {episodeId}.");
 
@@ -733,15 +879,7 @@ namespace OpenRA.Mods.Common.Traits
 					world.SetTickScale(1.0f);
 				}
 
-				if (MultiSessionMode)
-				{
-					Deactivate();
-				}
-				else
-				{
-					ScheduleProcessExit("connection lost", 500);
-				}
-
+				ScheduleProcessExit("connection lost", 500);
 				return;
 			}
 
@@ -796,7 +934,8 @@ namespace OpenRA.Mods.Common.Traits
 				agentConnected = false;
 			}
 
-			commander?.Tick();
+			if (!world.IsGameOver)
+				commander?.Tick();
 
 			// Issue any queued orders
 			while (orders.Count > 0)
@@ -806,9 +945,8 @@ namespace OpenRA.Mods.Common.Traits
 			// as the advance completes, and its next commands must land in the next tick,
 			// never in the rest of this one (that raced with wall-clock time and broke
 			// determinism).
-			// Check if fast-forward target tick has been reached (or interrupted, or the
-			// commander needs new decisions from the agent)
-			if (pendingFastAdvanceTarget > 0 && (world.WorldTick >= pendingFastAdvanceTarget
+			// In MultiSessionMode, PostWorldTick() runs after ALL player actors finish ITick.
+			if (!MultiSessionMode && pendingFastAdvanceTarget > 0 && (world.WorldTick >= pendingFastAdvanceTarget
 				|| (commander != null && commander.HasNewRequests)))
 			{
 				world.SetTickScale(1.0f);

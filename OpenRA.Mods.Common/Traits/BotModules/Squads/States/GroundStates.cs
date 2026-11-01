@@ -56,6 +56,9 @@ namespace OpenRA.Mods.Common.Traits.BotModules.Squads
 
 		protected virtual bool ShouldFlee(Squad owner)
 		{
+			if (owner.Fearless)
+				return false;
+
 			return ShouldFlee(owner, enemies => !AttackOrFleeFuzzy.Default.CanAttack(owner.Units, enemies));
 		}
 
@@ -104,7 +107,7 @@ namespace OpenRA.Mods.Common.Traits.BotModules.Squads
 			if (enemyUnits.Count == 0)
 				return;
 
-			if (AttackOrFleeFuzzy.Default.CanAttack(owner.Units, enemyUnits))
+			if (owner.Fearless || AttackOrFleeFuzzy.Default.CanAttack(owner.Units, enemyUnits))
 			{
 				owner.Bot.QueueOrder(new Order("AttackMove", null, owner.Target, false, groupedActors: owner.Units.ToArray()));
 

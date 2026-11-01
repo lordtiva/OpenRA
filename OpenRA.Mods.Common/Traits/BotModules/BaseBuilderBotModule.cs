@@ -206,6 +206,8 @@ namespace OpenRA.Mods.Common.Traits
 		readonly BaseBuilderQueueManager[] builders;
 		int currentBuilderIndex = 0;
 
+		public int TotalPlacementFailures => builders.Sum(b => b?.TotalPlacementFailures ?? 0);
+
 		public readonly ActorIndex.OwnerAndNamesAndTrait<BuildingInfo> RefineryBuildings;
 		readonly ActorIndex.OwnerAndNamesAndTrait<BuildingInfo> powerBuildings;
 		public readonly ActorIndex.OwnerAndNamesAndTrait<BuildingInfo> ConstructionYardBuildings;

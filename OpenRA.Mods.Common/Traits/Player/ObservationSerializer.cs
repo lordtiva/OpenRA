@@ -23,6 +23,7 @@ namespace OpenRA.Mods.Common.Traits
 	public sealed class ObservationSerializer
 	{
 		const int SpatialChannelCount = 9;
+		static readonly bool SpatialMapEnabled = Environment.GetEnvironmentVariable("OPENRA_RL_SPATIAL_MAP") == "1";
 
 		readonly World world;
 		readonly Player player;
@@ -65,7 +66,24 @@ namespace OpenRA.Mods.Common.Traits
 				MapInfo = SerializeMapInfo(),
 				Done = world.IsGameOver,
 				GlobalSummary = SerializeGlobalSummary(),
+				PlayerSlot = player?.InternalName ?? "",
+				PlayerFaction = player?.Faction?.InternalName ?? "",
 			};
+
+			var shroud = player?.Shroud;
+			if (shroud != null)
+			{
+				var totalCells = 0;
+				var exploredCells = 0;
+				foreach (var c in world.Map.AllCells)
+				{
+					totalCells++;
+					if (shroud.IsExplored(c))
+						exploredCells++;
+				}
+
+				obs.ExploredPercent = totalCells > 0 ? (float)exploredCells / totalCells * 100f : 0f;
+			}
 
 			if (world.IsGameOver)
 			{
@@ -82,7 +100,8 @@ namespace OpenRA.Mods.Common.Traits
 			SerializeVisibleEnemies(obs);
 			SerializeProduction(obs);
 			SerializeSupportPowers(obs);
-			SerializeSpatialMap(obs);
+			if (SpatialMapEnabled)
+				SerializeSpatialMap(obs);
 
 			return obs;
 		}

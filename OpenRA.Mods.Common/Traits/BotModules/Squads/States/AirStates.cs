@@ -131,6 +131,13 @@ namespace OpenRA.Mods.Common.Traits.BotModules.Squads
 				return;
 			}
 
+			if (owner.Bot is IBotDecisionBroker { ExternalControl: true })
+			{
+				if (owner.TargetActor != null && !owner.TargetActor.IsDead && owner.TargetActor.IsInWorld)
+					owner.FuzzyStateMachine.ChangeState(owner, new AirAttackState());
+				return;
+			}
+
 			var e = FindDefenselessTarget(owner);
 			if (e == null)
 				return;

@@ -161,6 +161,10 @@ namespace OpenRA.Mods.Common.Traits
 					peerCmds = request.PeerCommands;
 
 				bridge.SubmitDecisions(request.Decisions);
+				var peerSlot = string.IsNullOrEmpty(request.PeerSlot) ? "Multi0" : request.PeerSlot;
+				var peerBridge = ExternalBotBridge.LookupPlayerSession(request.SessionId, peerSlot);
+				if (peerBridge != null && !ReferenceEquals(peerBridge, bridge))
+					peerBridge.SubmitDecisions(request.PeerDecisions);
 
 				var advanceTask = bridge.RequestFastAdvance(
 					request.Ticks, request.Commands, context.CancellationToken,
@@ -263,7 +267,7 @@ namespace OpenRA.Mods.Common.Traits
 
 			var sessionId = RLSessionManager.CreateSession(
 				request.MapName, request.Bots, request.Seed,
-				request.PlayerFaction, request.EnemyFaction, request.AgentBrain);
+				request.PlayerFaction, request.EnemyFaction, request.AgentBrain, request.PeerBrain);
 
 			return Task.FromResult(new RLProto.CreateSessionResponse
 			{

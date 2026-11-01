@@ -272,18 +272,31 @@ namespace OpenRA.Mods.Common.Traits
 		/// the game world is created asynchronously on a background thread.
 		/// FastAdvance will wait for the bridge to activate before proceeding.
 		/// </summary>
-		/// <summary>v3 commander brain per session: "builtin" or "external" (default).</summary>
+		/// <summary>v3/v4 commander brain per session (and optional session|slot): "builtin" or "external" (default).</summary>
 		static readonly ConcurrentDictionary<string, string> SessionBrains = new();
 
-		internal static bool IsExternalBrain(string sessionId) =>
-			!SessionBrains.TryGetValue(sessionId ?? "", out var brain) || brain != "builtin";
+		internal static bool IsExternalBrain(string sessionId, string slotName = null)
+		{
+			var sid = sessionId ?? "";
+			if (!string.IsNullOrEmpty(slotName) && SessionBrains.TryGetValue(sid + "|" + slotName, out var slotBrain))
+				return slotBrain != "builtin";
+
+			return !SessionBrains.TryGetValue(sid, out var brain) || brain != "builtin";
+		}
 
 		public static string CreateSession(string mapName, string bots, int seed,
-			string playerFaction = null, string enemyFaction = null, string agentBrain = null)
+			string playerFaction = null, string enemyFaction = null,
+			string agentBrain = null, string peerBrain = null)
 		{
 			var sessionId = Guid.NewGuid().ToString("N")[..12];
 			if (!string.IsNullOrEmpty(agentBrain))
+			{
 				SessionBrains[sessionId] = agentBrain;
+				SessionBrains[sessionId + "|Multi1"] = agentBrain;
+			}
+
+			if (!string.IsNullOrEmpty(peerBrain))
+				SessionBrains[sessionId + "|Multi0"] = peerBrain;
 			Log.Write("rl-bridge",
 				$"Creating session {sessionId}: map={mapName}, bots={bots}, seed={seed}, " +
 				$"playerFaction={playerFaction ?? ""}, enemyFaction={enemyFaction ?? ""}");
@@ -476,6 +489,8 @@ namespace OpenRA.Mods.Common.Traits
 
 			ExternalBotBridge.EarlyWinReasonBySession.TryRemove(sessionId, out _);
 			SessionBrains.TryRemove(sessionId, out _);
+			SessionBrains.TryRemove(sessionId + "|Multi1", out _);
+			SessionBrains.TryRemove(sessionId + "|Multi0", out _);
 			// Registries already purged; drop poison mark. New CreateSession always
 			// mints a fresh id — no reuse path remains.
 			PoisonedSessions.TryRemove(sessionId, out _);
@@ -542,7 +557,10 @@ namespace OpenRA.Mods.Common.Traits
 				{
 					var didTick = orderManager.TryTick();
 					if (didTick)
+					{
 						world.Tick();
+						bridge.PostWorldTick();
+					}
 				}
 				catch (Exception e)
 				{
@@ -774,15 +792,16 @@ namespace OpenRA.Mods.Common.Traits
 			// hasn't been populated yet, causing NOT_FOUND.
 			SessionStates[sessionId] = new SessionState(orderManager, world);
 
-			// 8. Find the ExternalBotBridge
+			// 8. Find all ExternalBotBridge instances; prefer Multi1 as primary in RL-vs-RL.
 			ExternalBotBridge bridge = null;
 			foreach (var player in world.Players)
 			{
 				var b = player.PlayerActor.TraitOrDefault<ExternalBotBridge>();
 				if (b != null && b.IsEnabled)
 				{
-					bridge = b;
-					break;
+					ExternalBotBridge.PlayerSessions[sessionId + "|" + player.InternalName] = b;
+					if (bridge == null || string.Equals(player.InternalName, "Multi1", StringComparison.Ordinal))
+						bridge = b;
 				}
 			}
 
@@ -795,13 +814,11 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			}
 
-			// Re-register under the requested sessionId
+			// Re-register primary bridge under the requested sessionId
 			var actualId = bridge.SessionId;
 			if (actualId != sessionId)
-			{
 				ExternalBotBridge.Sessions.TryRemove(actualId, out _);
-				ExternalBotBridge.Sessions[sessionId] = bridge;
-			}
+			ExternalBotBridge.Sessions[sessionId] = bridge;
 
 			Log.Write("rl-bridge", $"Session {sessionId}: Ready (init thread exiting)");
 		}
@@ -816,13 +833,12 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		/// <summary>
-		/// Aliados (rl/docs/contract/ra-aliados.md): Empty / Random → RandomAllies
-		/// (england|france|germany). Explicit england/france/germany pass through.
+		/// Empty → default RandomAllies for backward compatibility with v3.
+		/// Explicit factions or "Random" / "RandomSoviet" pass through directly in v4.
 		/// </summary>
 		internal static string ResolvePlayerFaction(string asked)
 		{
-			if (string.IsNullOrWhiteSpace(asked)
-				|| string.Equals(asked, "Random", StringComparison.OrdinalIgnoreCase))
+			if (string.IsNullOrWhiteSpace(asked))
 				return "RandomAllies";
 			return asked;
 		}
@@ -875,13 +891,14 @@ namespace OpenRA.Mods.Common.Traits
 			{
 				var botInfos = mapPreview.PlayerActorInfo.TraitInfos<IBotInfo>().ToList();
 				var rng = new MersenneTwister();
+				var parsedEntries = botsConfig.Split(',')
+					.Select(e => e.Trim().Split(':'))
+					.Where(p => p.Length == 2)
+					.ToList();
+				var multi1IsRl = parsedEntries.Any(p => string.Equals(p[0], "Multi1", StringComparison.Ordinal) && IsRlAgentBot(p[1]));
 
-				foreach (var entry in botsConfig.Split(','))
+				foreach (var parts in parsedEntries)
 				{
-					var parts = entry.Trim().Split(':');
-					if (parts.Length != 2)
-						continue;
-
 					var slotName = parts[0];
 					var botType = parts[1];
 
@@ -898,6 +915,10 @@ namespace OpenRA.Mods.Common.Traits
 						continue;
 					}
 
+					var isPrimaryLearnerSlot = multi1IsRl
+						? string.Equals(slotName, "Multi1", StringComparison.Ordinal)
+						: IsRlAgentBot(botType);
+
 					var clientIndex = Interlocked.Increment(ref nextClientIndex);
 					var botClient = new Session.Client
 					{
@@ -905,7 +926,7 @@ namespace OpenRA.Mods.Common.Traits
 						Name = botInfo.Name,
 						Bot = botType,
 						Slot = slotName,
-						Faction = IsRlAgentBot(botType)
+						Faction = isPrimaryLearnerSlot
 							? ResolvePlayerFaction(playerFaction)
 							: ResolveEnemyFaction(enemyFaction),
 						SpawnPoint = 0,

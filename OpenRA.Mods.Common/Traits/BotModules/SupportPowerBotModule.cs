@@ -67,6 +67,9 @@ namespace OpenRA.Mods.Common.Traits
 
 		void IBotTick.BotTick(IBot bot)
 		{
+			if (bot is IBotDecisionBroker { ExternalControl: true })
+				return;
+
 			foreach (var sp in supportPowerManager.Powers.Values)
 			{
 				if (sp.Disabled)

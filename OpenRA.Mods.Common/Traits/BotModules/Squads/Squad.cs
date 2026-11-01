@@ -22,6 +22,7 @@ namespace OpenRA.Mods.Common.Traits.BotModules.Squads
 	{
 		public HashSet<Actor> Units = [];
 		public SquadType Type;
+		public bool Fearless;
 
 		internal IBot Bot;
 		internal World World;

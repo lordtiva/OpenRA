@@ -21,6 +21,7 @@ namespace OpenRA.Mods.Common.Traits
 	{
 		public readonly string Category;
 		public int WaitTicks;
+		public int TotalPlacementFailures { get; private set; }
 
 		readonly BaseBuilderBotModule baseBuilder;
 		readonly World world;
@@ -210,6 +211,8 @@ namespace OpenRA.Mods.Common.Traits
 
 				if (location == null)
 				{
+					TotalPlacementFailures++;
+
 					// If we just reached the maximum fail count, cache the number of current structures
 					if (++failCount >= baseBuilder.Info.MaximumFailedPlacementAttempts)
 					{
@@ -544,7 +547,11 @@ namespace OpenRA.Mods.Common.Traits
 
 					var targetCell = closestEnemy != null ? closestEnemy.Location : baseCenter;
 
-					return FindPos(baseBuilder.DefenseCenter, targetCell, baseBuilder.Info.MinimumDefenseRadius, baseBuilder.Info.MaximumDefenseRadius);
+					var defPos = FindPos(baseBuilder.DefenseCenter, targetCell, baseBuilder.Info.MinimumDefenseRadius, baseBuilder.Info.MaximumDefenseRadius);
+					if (defPos.Location != null)
+						return defPos;
+
+					return FindPos(baseCenter, targetCell, baseBuilder.Info.MinBaseRadius, baseBuilder.Info.MaxBaseRadius * 2);
 
 				case BuildingType.Refinery:
 
@@ -598,12 +605,20 @@ namespace OpenRA.Mods.Common.Traits
 					if (baseBuilder.RequestedRefineries.Count > 0)
 						baseBuilder.RequestedRefineries.Remove(requestRef);
 
-					// Try and find a free spot somewhere else in the base
-					return FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius, baseBuilder.Info.MaxBaseRadius);
+					// Try and find a free spot somewhere else in the base (expanding ring if primary radius is saturated)
+					var refFallback = FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius, baseBuilder.Info.MaxBaseRadius);
+					if (refFallback.Location != null)
+						return refFallback;
+
+					return FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius, baseBuilder.Info.MaxBaseRadius * 2);
 
 				case BuildingType.Building:
-					return FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius,
+					var bldPos = FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius,
 						distanceToBaseIsImportant ? baseBuilder.Info.MaxBaseRadius : world.Map.Grid.MaximumTileSearchRange);
+					if (bldPos.Location != null || !distanceToBaseIsImportant)
+						return bldPos;
+
+					return FindPos(baseCenter, baseCenter, baseBuilder.Info.MinBaseRadius, baseBuilder.Info.MaxBaseRadius * 2);
 			}
 
 			// Can't find a build location

@@ -81,43 +81,57 @@ message GameObservation {
     // SupportPowerManager keys that are Ready (Chronoshift, NukePowerOrder, ...).
     repeated string ready_support_powers = 23;
 
-    // v3 commander: decisions the agent must answer in the next FastAdvance
-    // (brain "external"). Unanswered requests count as "wait".
+    // v3/v4 commander: decisions the agent must answer in the next FastAdvance
+    // (brain "external"). Unanswered requests count as "wait" (or "keep" for ARMY).
     repeated DecisionRequest pending_decisions = 24;
     // Decisions taken by the built-in bot logic since the last observation
     // (brain "builtin"): the teacher signal for imitation.
     repeated TeacherDecision teacher_decisions = 25;
+
+    // v4 RL-vs-RL lock-step: peer slot observation (e.g. Multi0) serialized at
+    // the exact same WorldTick end, eliminating a second RPC and race conditions.
+    GameObservation peer_observation = 26;
+    // Internal faction name resolved for this player (e.g. "england", "russia", "ukraine").
+    string player_faction = 27;
+    // Cumulative failed building placement attempts in BaseBuilderBotModule.
+    int32 placement_failures = 28;
+    // Actor IDs currently assigned to the independent HARASS tactical group.
+    repeated uint32 harass_unit_ids = 29;
   }
 
-// ─── v3 commander decisions ─────────────────────────────────────────────────
+// ─── v3/v4 commander decisions ──────────────────────────────────────────────
 
 enum DecisionKind {
   DECISION_NONE = 0;
   DECIDE_BUILD = 1;   // a structure queue (Building / Defense) is free
-  DECIDE_TRAIN = 2;   // a unit queue (Infantry / Vehicle / ...) is free
-  DECIDE_ARMY = 3;    // periodic: where the main army goes
+  DECIDE_TRAIN = 2;   // a unit queue (Infantry / Vehicle / Aircraft / Ship) is free
+  DECIDE_ARMY = 3;    // periodic: tactical group orders (queue = "MAIN" | "HARASS" | "AIR")
+  DECIDE_SUPPORT = 4; // targeted support power ready (queue = OrderName)
 }
 
 message TargetCandidate {
   int32 cell_x = 1;
   int32 cell_y = 2;
-  string kind = 3;   // "enemy_spawn" | "enemy_building"
-  string type = 4;   // actor type for enemy_building
+  string kind = 3;   // "enemy_spawn" | "enemy_building" | "enemy_harvester" | "enemy_mobile" | "unexplored" | "stale"
+  string type = 4;   // actor type for enemy_building / enemy_harvester / enemy_mobile
 }
 
 message DecisionRequest {
   uint32 id = 1;
   DecisionKind kind = 2;
-  string queue = 3;                      // BUILD/TRAIN: production queue type
+  string queue = 3;                      // BUILD/TRAIN: queue; ARMY: group ("MAIN"|"HARASS"|"AIR"); SUPPORT: OrderName
   repeated string options = 4;           // BUILD/TRAIN: items buildable right now
-  repeated TargetCandidate targets = 5;  // ARMY: attack candidates
+  repeated TargetCandidate targets = 5;  // ARMY / SUPPORT: target candidates
   int32 tick = 6;
 }
 
 message Decision {
   uint32 request_id = 1;
-  string choice = 2;        // BUILD/TRAIN: one of options; "" = wait
-  // ARMY: -1 = hold (call off the attack, back home), k = attack targets[k].
+  // BUILD/TRAIN: one of options; "" = wait.
+  // ARMY ("MAIN"): "all_in" = fearless assault (disables fuzzy retreat).
+  string choice = 2;
+  // ARMY: -1 = hold / merge_main, k = attack/scout/strike targets[k].
+  // SUPPORT: -1 = wait, k = fire support power on targets[k].
   // Leaving an ARMY request unanswered keeps the current orders.
   int32 target_index = 3;
 }
@@ -308,9 +322,11 @@ message FastAdvanceRequest {
   repeated Command peer_commands = 6;
   string peer_slot = 7;  // default "Multi0" when peer_commands non-empty
 
-  // v3 commander: answers to the previous observation's pending_decisions.
+  // v3/v4 commander: answers to the previous observation's pending_decisions.
   // With brain "external" the advance also stops early when new decisions arise.
   repeated Decision decisions = 8;
+  // v4 RL-vs-RL: answers to peer_observation.pending_decisions for peer_slot (default "Multi0").
+  repeated Decision peer_decisions = 9;
 }
 
 // ─── Session Management (Multi-Session Mode) ────────────────────────────────
@@ -319,14 +335,15 @@ message CreateSessionRequest {
   string map_name = 1;    // Map filename or UID
   string bots = 2;        // Bot config: "Multi1:rl-agent,Multi0:beginner"
   int32 seed = 3;         // Random seed (0 = random)
-  // Empty → C# default RandomAllies on the rl-agent slot (doc 24).
-  // Valid: RandomAllies, england, france, germany (not Random: rewritten).
+  // Empty → C# default RandomAllies on the primary rl-agent slot (v3 compatibility).
+  // Explicit faction or "Random" / "RandomAllies" / "RandomSoviet" passes through in v4.
   string player_faction = 4;
-  // Empty → Random for scripted/other slots.
+  // Empty → Random for scripted/peer slots.
   string enemy_faction = 5;
-  // v3 commander brain for the rl-agent slot: "external" (agent decides,
-  // default) or "builtin" (the normal bot logic decides and reports teacher_decisions).
+  // Commander brain for primary rl-agent slot (Multi1): "external" (default) or "builtin".
   string agent_brain = 6;
+  // v4 RL-vs-RL: commander brain for peer rl-agent slot (Multi0): "external" (default) or "builtin".
+  string peer_brain = 7;
 }
 
 message CreateSessionResponse {
