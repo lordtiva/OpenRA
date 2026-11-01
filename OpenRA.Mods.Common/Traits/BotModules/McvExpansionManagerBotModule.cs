@@ -1,4 +1,4 @@
-﻿#region Copyright & License Information
+#region Copyright & License Information
 /*
  * Copyright (c) The OpenRA Developers and Contributors
  * This file is part of OpenRA, which is free software. It is made
@@ -566,6 +566,9 @@ namespace OpenRA.Mods.Common.Traits
 
 		void BuildMCV(IBot bot)
 		{
+			if (bot is IBotDecisionBroker broker && broker.ExternalControl)
+				return;
+
 			if (Info.McvTypes.Count <= 0)
 				return;
 			if (AIUtils.CountActorByCommonName(mcvFactories) <= 0)
@@ -614,6 +617,9 @@ namespace OpenRA.Mods.Common.Traits
 
 		void UnDeployConyard(IBot bot)
 		{
+			if (bot is IBotDecisionBroker broker && broker.ExternalControl)
+				return;
+
 			if (mustUndeployCoyard != null && mustUndeployCoyard.IsInWorld && !mustUndeployCoyard.IsDead && mustUndeployCoyard.Owner == player)
 			{
 				bot.QueueOrder(new Order("DeployTransform", mustUndeployCoyard, true));
