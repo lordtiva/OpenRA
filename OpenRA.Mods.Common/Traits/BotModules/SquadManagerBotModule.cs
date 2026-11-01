@@ -127,8 +127,8 @@ namespace OpenRA.Mods.Common.Traits
 		readonly HashSet<Actor> activeUnits = [];
 
 		// v4 tactical groups: independent fast scout/harass detachment kept separate from MAIN.
-		static readonly FrozenSet<string> FastHarassTypes = new HashSet<string> { "jeep", "ftrk", "apc" }.ToFrozenSet();
-		const int MaxHarassUnits = 4;
+		static readonly FrozenSet<string> FastHarassTypes = new HashSet<string> { "jeep" }.ToFrozenSet();
+		const int MaxHarassUnits = 2;
 		readonly HashSet<Actor> rlHarassUnits = [];
 		Squad rlHarassSquad;
 
@@ -372,20 +372,30 @@ namespace OpenRA.Mods.Common.Traits
 					TryToRushAttack(bot);
 			}
 
-			if (--attackForceTicks <= 0)
+			if (!external)
 			{
-				attackForceTicks = Info.AttackForceInterval;
-				foreach (var s in Squads)
-					squadsPendingUpdate.Push(s);
-			}
+				if (--attackForceTicks <= 0)
+				{
+					attackForceTicks = Info.AttackForceInterval;
+					foreach (var s in Squads)
+						squadsPendingUpdate.Push(s);
+				}
 
-			// PERF: Spread out squad updates across multiple ticks.
-			var updateCount = Exts.IntegerDivisionRoundingAwayFromZero(squadsPendingUpdate.Count, attackForceTicks);
-			for (var i = 0; i < updateCount; i++)
+				// PERF: Spread out squad updates across multiple ticks.
+				var updateCount = Exts.IntegerDivisionRoundingAwayFromZero(squadsPendingUpdate.Count, attackForceTicks);
+				for (var i = 0; i < updateCount; i++)
+				{
+					var squadPendingUpdate = squadsPendingUpdate.Pop();
+					if (squadPendingUpdate.IsValid)
+						squadPendingUpdate.Update();
+				}
+			}
+			else
 			{
-				var squadPendingUpdate = squadsPendingUpdate.Pop();
-				if (squadPendingUpdate.IsValid)
-					squadPendingUpdate.Update();
+				// For external control, Air squad still needs Update() for rearm/refuel cycle
+				var air = GetSquadOfType(SquadType.Air);
+				if (air != null && air.IsValid)
+					air.Update();
 			}
 
 			if (--assignRolesTicks <= 0)
@@ -401,7 +411,7 @@ namespace OpenRA.Mods.Common.Traits
 					CreateAttackForce(bot);
 			}
 
-			if (respondToAttackCooldown-- == MaxRespondToAttackCooldown)
+			if (!external && respondToAttackCooldown-- == MaxRespondToAttackCooldown)
 				ProtectOwn(bot, protectFrom);
 		}
 
@@ -711,13 +721,13 @@ namespace OpenRA.Mods.Common.Traits
 				activeUnits.Add(fast);
 			}
 
-			// Early-game fallback: up to 2 scouts (dogs or rifles) when no fast vehicles exist yet.
-			if (rlHarassUnits.Count == 0 && CountOrderableGroundUnits() >= 5)
+			// Early-game fallback: 1 scout (dog or rifle) when no fast vehicles exist yet.
+			if (rlHarassUnits.Count == 0 && CountOrderableGroundUnits() >= 3)
 			{
 				var scouts = unitsHangingAroundTheBase
-					.Where(a => !unitCannotBeOrdered(a) && (a.Info.Name == "e1" || a.Info.Name == "dog"))
+					.Where(a => !unitCannotBeOrdered(a) && (a.Info.Name == "dog" || a.Info.Name == "e1"))
 					.OrderBy(a => a.ActorID)
-					.Take(2)
+					.Take(1)
 					.ToList();
 				foreach (var sc in scouts)
 				{
@@ -741,10 +751,7 @@ namespace OpenRA.Mods.Common.Traits
 		internal void RLAttackMain(IBot bot, CPos cell, WDist radius, bool fearless = false)
 		{
 			CleanSquads();
-			var orderable = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
-			var homeUnits = !fearless && orderable.Any(a => !a.Info.HasTraitInfo<TakeCoverInfo>())
-				? orderable.Where(a => !a.Info.HasTraitInfo<TakeCoverInfo>()).ToList()
-				: orderable;
+			var homeUnits = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
 			var existingSquads = Squads.Where(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad)).ToList();
 
 			if (homeUnits.Count == 0 && existingSquads.Count == 0)
@@ -757,9 +764,10 @@ namespace OpenRA.Mods.Common.Traits
 				.ToList();
 
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
+			var isBuilding = enemyActor != null && enemyActor.Info.HasTraitInfo<BuildingInfo>();
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
-			var orderTarget = enemyActor != null ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
-			var orderName = enemyActor != null ? "Attack" : "AssaultMove";
+			var orderTarget = enemyActor != null && !isBuilding ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
+			var orderName = enemyActor != null && !isBuilding ? "Attack" : "AssaultMove";
 
 			// Keep existing assault squads active on the front line; retarget them without dismantling or freezing them.
 			foreach (var sq in existingSquads)
@@ -779,7 +787,9 @@ namespace OpenRA.Mods.Common.Traits
 			if (homeUnits.Count >= (existingSquads.Count > 0 ? 4 : 1))
 			{
 				unitsHangingAroundTheBase.RemoveAll(homeUnits.Contains);
-				var squad = RegisterNewSquad(bot, SquadType.Assault, target);
+				var squad = existingSquads.FirstOrDefault();
+				if (squad == null)
+					squad = RegisterNewSquad(bot, SquadType.Assault, target);
 				squad.Fearless = true;
 				squad.Units.UnionWith(homeUnits);
 				bot.QueueOrder(new Order(orderName, null, orderTarget, false, groupedActors: homeUnits.ToArray()));
@@ -810,14 +820,15 @@ namespace OpenRA.Mods.Common.Traits
 					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))))
 				.ToList();
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
+			var isBuilding = enemyActor != null && enemyActor.Info.HasTraitInfo<BuildingInfo>();
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
-			var orderTarget = enemyActor != null ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
+			var orderTarget = enemyActor != null && !isBuilding ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
 
 			rlHarassSquad = RegisterNewSquad(bot, SquadType.Rush, target);
 			rlHarassSquad.Fearless = true;
 			rlHarassSquad.Units.UnionWith(units);
 			activeUnits.UnionWith(rlHarassUnits);
-			var orderName = enemyActor != null ? "Attack" : "AssaultMove";
+			var orderName = enemyActor != null && !isBuilding ? "Attack" : "AssaultMove";
 			bot.QueueOrder(new Order(orderName, null, orderTarget, false, groupedActors: units));
 		}
 
