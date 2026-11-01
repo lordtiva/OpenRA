@@ -764,10 +764,9 @@ namespace OpenRA.Mods.Common.Traits
 				.ToList();
 
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
-			var isBuilding = enemyActor != null && enemyActor.Info.HasTraitInfo<BuildingInfo>();
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
-			var orderTarget = enemyActor != null && !isBuilding ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
-			var orderName = enemyActor != null && !isBuilding ? "Attack" : "AssaultMove";
+			var orderTarget = Target.FromCell(World, cell);
+			var orderName = "AssaultMove";
 
 			// Keep existing assault squads active on the front line; retarget them without dismantling or freezing them.
 			foreach (var sq in existingSquads)
@@ -820,15 +819,14 @@ namespace OpenRA.Mods.Common.Traits
 					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))))
 				.ToList();
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
-			var isBuilding = enemyActor != null && enemyActor.Info.HasTraitInfo<BuildingInfo>();
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
-			var orderTarget = enemyActor != null && !isBuilding ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
+			var orderTarget = Target.FromCell(World, cell);
+			var orderName = "AssaultMove";
 
 			rlHarassSquad = RegisterNewSquad(bot, SquadType.Rush, target);
 			rlHarassSquad.Fearless = true;
 			rlHarassSquad.Units.UnionWith(units);
 			activeUnits.UnionWith(rlHarassUnits);
-			var orderName = enemyActor != null && !isBuilding ? "Attack" : "AssaultMove";
 			bot.QueueOrder(new Order(orderName, null, orderTarget, false, groupedActors: units));
 		}
 
