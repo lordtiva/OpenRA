@@ -774,17 +774,17 @@ namespace OpenRA.Mods.Common.Traits
 
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
+			var orderTarget = enemyActor != null ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
 
 			// Keep existing assault squads active on the front line; retarget them without dismantling or freezing them.
 			foreach (var sq in existingSquads)
 			{
-				sq.Fearless = fearless;
+				sq.Fearless = true;
 				if (sq.Units.Count > 0)
 				{
 					if (enemyActor != null)
 						sq.SetActorToTarget(target);
-					else
-						bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: sq.Units.ToArray()));
+					bot.QueueOrder(new Order("AttackMove", null, orderTarget, false, groupedActors: sq.Units.ToArray()));
 				}
 			}
 
@@ -793,10 +793,9 @@ namespace OpenRA.Mods.Common.Traits
 			{
 				unitsHangingAroundTheBase.RemoveAll(homeUnits.Contains);
 				var squad = RegisterNewSquad(bot, SquadType.Assault, target);
-				squad.Fearless = fearless;
+				squad.Fearless = true;
 				squad.Units.UnionWith(homeUnits);
-				if (enemyActor == null)
-					bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: homeUnits.ToArray()));
+				bot.QueueOrder(new Order("AttackMove", null, orderTarget, false, groupedActors: homeUnits.ToArray()));
 			}
 
 			foreach (var n in notifyIdleBaseUnits)
@@ -825,18 +824,13 @@ namespace OpenRA.Mods.Common.Traits
 				.ToList();
 			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
 			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
-
-			if (enemyActor == null)
-			{
-				// Keep units in rlHarassUnits so MAIN never yanks them back mid-scout!
-				activeUnits.UnionWith(rlHarassUnits);
-				bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: units));
-				return;
-			}
+			var orderTarget = enemyActor != null ? Target.FromActor(enemyActor) : Target.FromCell(World, cell);
 
 			rlHarassSquad = RegisterNewSquad(bot, SquadType.Rush, target);
+			rlHarassSquad.Fearless = true;
 			rlHarassSquad.Units.UnionWith(units);
 			activeUnits.UnionWith(rlHarassUnits);
+			bot.QueueOrder(new Order("AttackMove", null, orderTarget, false, groupedActors: units));
 		}
 
 		internal void RLAttackAir(IBot bot, CPos cell, WDist radius)
