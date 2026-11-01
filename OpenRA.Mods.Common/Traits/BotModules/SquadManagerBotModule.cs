@@ -127,7 +127,7 @@ namespace OpenRA.Mods.Common.Traits
 		readonly HashSet<Actor> activeUnits = [];
 
 		// v4 tactical groups: independent fast scout/harass detachment kept separate from MAIN.
-		static readonly FrozenSet<string> FastHarassTypes = new HashSet<string> { "jeep", "1tnk", "ftrk", "apc" }.ToFrozenSet();
+		static readonly FrozenSet<string> FastHarassTypes = new HashSet<string> { "jeep", "ftrk", "apc" }.ToFrozenSet();
 		const int MaxHarassUnits = 4;
 		readonly HashSet<Actor> rlHarassUnits = [];
 		Squad rlHarassSquad;
@@ -759,25 +759,55 @@ namespace OpenRA.Mods.Common.Traits
 
 		internal void RLAttackMain(IBot bot, CPos cell, WDist radius, bool fearless = false)
 		{
-			var army = TakeMainArmy();
-			if (army.Count == 0)
+			CleanSquads();
+			var homeUnits = unitsHangingAroundTheBase.Where(a => !rlHarassUnits.Contains(a) && !unitCannotBeOrdered(a)).ToList();
+			var existingSquads = Squads.Where(s => s.IsValid && (s.Type == SquadType.Assault || s.Type == SquadType.Rush) && !ReferenceEquals(s, rlHarassSquad)).ToList();
+
+			if (homeUnits.Count == 0 && existingSquads.Count == 0)
 				return;
 
 			var pos = World.Map.CenterOfCell(cell);
-			var source = army.MinBy(a => (a.CenterPosition - pos).LengthSquared);
-			var target = FindEnemies(World.FindActorsInCircle(pos, radius), source)
-				.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+			var visibleCandidates = World.FindActorsInCircle(pos, radius)
+				.Where(a => IsPreferredEnemyUnit(a) && (a.CanBeViewedByPlayer(Player)
+					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))));
 
-			if (target.Actor == null)
+			// Keep existing assault squads active on the front line; retarget them without dismantling or freezing them.
+			foreach (var sq in existingSquads)
 			{
-				bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: army.ToArray()));
-				ReturnToBasePool(army);
-				return;
+				sq.Fearless = fearless;
+				if (sq.Units.Count > 0)
+				{
+					var source = sq.Units.MinBy(a => (a.CenterPosition - pos).LengthSquared);
+					var target = FindEnemies(visibleCandidates, source)
+						.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+					if (target.Actor != null)
+						sq.SetActorToTarget(target);
+					else
+						bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: sq.Units.ToArray()));
+				}
 			}
 
-			var squad = RegisterNewSquad(bot, SquadType.Assault, target);
-			squad.Fearless = fearless;
-			squad.Units.UnionWith(army);
+			// Deploy any idle home units into the attack wave (as their own squad or attack-move).
+			if (homeUnits.Count > 0)
+			{
+				unitsHangingAroundTheBase.RemoveAll(homeUnits.Contains);
+				var source = homeUnits.MinBy(a => (a.CenterPosition - pos).LengthSquared);
+				var target = FindEnemies(visibleCandidates, source)
+					.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+
+				if (target.Actor != null)
+				{
+					var squad = RegisterNewSquad(bot, SquadType.Assault, target);
+					squad.Fearless = fearless;
+					squad.Units.UnionWith(homeUnits);
+				}
+				else
+				{
+					bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: homeUnits.ToArray()));
+					ReturnToBasePool(homeUnits);
+				}
+			}
+
 			foreach (var n in notifyIdleBaseUnits)
 				n.UpdatedIdleBaseUnits(unitsHangingAroundTheBase);
 		}
