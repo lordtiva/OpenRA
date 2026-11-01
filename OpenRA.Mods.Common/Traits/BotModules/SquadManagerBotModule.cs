@@ -769,7 +769,11 @@ namespace OpenRA.Mods.Common.Traits
 			var pos = World.Map.CenterOfCell(cell);
 			var visibleCandidates = World.FindActorsInCircle(pos, radius)
 				.Where(a => IsPreferredEnemyUnit(a) && (a.CanBeViewedByPlayer(Player)
-					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))));
+					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))))
+				.ToList();
+
+			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
+			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
 
 			// Keep existing assault squads active on the front line; retarget them without dismantling or freezing them.
 			foreach (var sq in existingSquads)
@@ -777,35 +781,22 @@ namespace OpenRA.Mods.Common.Traits
 				sq.Fearless = fearless;
 				if (sq.Units.Count > 0)
 				{
-					var source = sq.Units.MinBy(a => (a.CenterPosition - pos).LengthSquared);
-					var target = FindEnemies(visibleCandidates, source)
-						.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
-					if (target.Actor != null)
+					if (enemyActor != null)
 						sq.SetActorToTarget(target);
 					else
 						bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: sq.Units.ToArray()));
 				}
 			}
 
-			// Deploy any idle home units into the attack wave (as their own squad or attack-move).
+			// Deploy any idle home units into the attack wave (as their own squad).
 			if (homeUnits.Count > 0)
 			{
 				unitsHangingAroundTheBase.RemoveAll(homeUnits.Contains);
-				var source = homeUnits.MinBy(a => (a.CenterPosition - pos).LengthSquared);
-				var target = FindEnemies(visibleCandidates, source)
-					.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
-
-				if (target.Actor != null)
-				{
-					var squad = RegisterNewSquad(bot, SquadType.Assault, target);
-					squad.Fearless = fearless;
-					squad.Units.UnionWith(homeUnits);
-				}
-				else
-				{
+				var squad = RegisterNewSquad(bot, SquadType.Assault, target);
+				squad.Fearless = fearless;
+				squad.Units.UnionWith(homeUnits);
+				if (enemyActor == null)
 					bot.QueueOrder(new Order("AttackMove", null, Target.FromCell(World, cell), false, groupedActors: homeUnits.ToArray()));
-					ReturnToBasePool(homeUnits);
-				}
 			}
 
 			foreach (var n in notifyIdleBaseUnits)
@@ -828,14 +819,14 @@ namespace OpenRA.Mods.Common.Traits
 
 			var units = rlHarassUnits.OrderBy(a => a.ActorID).ToArray();
 			var pos = World.Map.CenterOfCell(cell);
-			var source = units.MinBy(a => (a.CenterPosition - pos).LengthSquared);
 			var visibleCandidates = World.FindActorsInCircle(pos, radius)
 				.Where(a => IsPreferredEnemyUnit(a) && (a.CanBeViewedByPlayer(Player)
-					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))));
-			var target = FindEnemies(visibleCandidates, source)
-				.MinByOrDefault(x => (x.Actor.CenterPosition - pos).LengthSquared);
+					|| (a.Info.HasTraitInfo<BuildingInfo>() && Player.Shroud.IsExplored(a.Location))))
+				.ToList();
+			var enemyActor = visibleCandidates.MinByOrDefault(a => (a.Location - cell).LengthSquared);
+			var target = enemyActor != null ? (enemyActor, WVec.Zero) : default;
 
-			if (target.Actor == null)
+			if (enemyActor == null)
 			{
 				// Keep units in rlHarassUnits so MAIN never yanks them back mid-scout!
 				activeUnits.UnionWith(rlHarassUnits);
