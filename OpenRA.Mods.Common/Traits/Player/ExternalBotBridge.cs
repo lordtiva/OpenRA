@@ -55,7 +55,7 @@ namespace OpenRA.Mods.Common.Traits
 		public override object Create(ActorInitializer init) { return new ExternalBotBridge(this, init); }
 	}
 
-	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated, INotifyDamage, IBotDecisionBroker
+	public sealed class ExternalBotBridge : ITick, IBot, INotifyCreated, INotifyDamage, IBotDecisionBroker, INotifyActorDisposing
 	{
 		// v3: strategic decisions (BUILD / TRAIN / ARMY) for the bot modules enabled on this player.
 		RLCommander commander;
@@ -71,6 +71,11 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			if (IsEnabled && !self.World.IsLoadingGameSave)
 				commander?.Damaged(self, e);
+		}
+
+		void INotifyActorDisposing.Disposing(Actor self)
+		{
+			Deactivate();
 		}
 
 		/// <summary>gRPC thread: answers to the previous observation's pending decisions.</summary>
@@ -113,13 +118,40 @@ namespace OpenRA.Mods.Common.Traits
 		static bool grpcServerStarted;
 		static readonly ManualResetEventSlim GrpcListen = new(false);
 		static volatile bool grpcListenOk;
+		static int boundGrpcPort = 0;
 
 		/// <summary>
-		/// GUI skirmish must not share docker compose's host :9999 (train).
+		/// GUI skirmish must not share docker compose's host :9999-10004 (train).
 		/// Headless / MultiSession keep yaml Port (9999).
 		/// </summary>
-		const int GuiGrpcPort = 10001;
+		const int GuiGrpcPort = 10010;
 		static readonly object GrpcLock = new();
+
+		static int FindAvailablePort(int startPort)
+		{
+			for (var port = startPort; port < startPort + 100; port++)
+			{
+				try
+				{
+					using var socket = new System.Net.Sockets.Socket(
+						System.Net.Sockets.Socket.OSSupportsIPv6 ? System.Net.Sockets.AddressFamily.InterNetworkV6 : System.Net.Sockets.AddressFamily.InterNetwork,
+						System.Net.Sockets.SocketType.Stream,
+						System.Net.Sockets.ProtocolType.Tcp);
+					socket.ExclusiveAddressUse = true;
+					if (System.Net.Sockets.Socket.OSSupportsIPv6)
+						socket.DualMode = true;
+					socket.Bind(new System.Net.IPEndPoint(System.Net.Sockets.Socket.OSSupportsIPv6 ? System.Net.IPAddress.IPv6Any : System.Net.IPAddress.Any, port));
+					socket.Close();
+					return port;
+				}
+				catch
+				{
+					// Port is in use, try next
+				}
+			}
+
+			return startPort;
+		}
 
 		public volatile bool IsEnabled;
 
@@ -459,26 +491,43 @@ namespace OpenRA.Mods.Common.Traits
 			// In single-session (legacy) mode, start gRPC server from here
 			if (!MultiSessionMode)
 			{
-				var port = info.Port;
+				// Clean up any stale sessions from prior matches
+				foreach (var key in Sessions.Keys.ToList())
+				{
+					if (Sessions.TryGetValue(key, out var old) && (old.SessionDone.IsSet || !old.IsEnabled || (old.world != null && old.world.IsGameOver)))
+					{
+						old.Deactivate();
+						Sessions.TryRemove(key, out _);
+					}
+				}
+
+				int port;
 				var envPort = Environment.GetEnvironmentVariable("RL_GRPC_PORT");
 				if (!string.IsNullOrEmpty(envPort) && int.TryParse(envPort, out var pp))
 					port = pp;
+				else if (boundGrpcPort != 0)
+					port = boundGrpcPort;
 				else if (!Game.IsHeadless)
-					port = GuiGrpcPort;
+				{
+					port = FindAvailablePort(GuiGrpcPort);
+					boundGrpcPort = port;
+				}
+				else
+					port = info.Port;
 
 				var alreadyListening = grpcServerStarted && grpcListenOk;
-				if (!Game.IsHeadless && !alreadyListening)
+				if (!alreadyListening)
 				{
 					GrpcListen.Reset();
 					grpcListenOk = false;
-				}
 
-				var thread = new Thread(() => StartGrpcServer(port))
-				{
-					IsBackground = true,
-					Name = "RL-Bridge-gRPC"
-				};
-				thread.Start();
+					var thread = new Thread(() => StartGrpcServer(port))
+					{
+						IsBackground = true,
+						Name = "RL-Bridge-gRPC"
+					};
+					thread.Start();
+				}
 
 				// GUI skirmish: spawn the Python PPO sidecar so picking
 				// "PPO Agent" in the lobby is enough. Headless train does not.
@@ -490,7 +539,7 @@ namespace OpenRA.Mods.Common.Traits
 					{
 						Log.Write("rl-bridge",
 							$"gRPC :{port} did not listen — not starting sidecar. " +
-							"Is docker/train using this port? GUI default is 10001.");
+							"Is docker/train using this port? GUI default is 10010.");
 					}
 					else
 						TryStartPpoSidecar(port);
@@ -501,7 +550,7 @@ namespace OpenRA.Mods.Common.Traits
 						Thread.Sleep(30000);
 						if (!captured.agentConnected && captured.IsEnabled)
 						{
-							Log.Write("rl-bridge", "PPO sidecar did not connect in 30s — unpausing so the human is not stuck");
+							Log.Write("rl-bridge", $"PPO sidecar for {captured.player?.InternalName ?? "unknown"} did not connect in 30s — unpausing so game is not stuck");
 							try { world.SetLocalPauseState(false); }
 							catch (Exception e) { Log.Write("rl-bridge", $"unpause timeout: {e.Message}"); }
 						}
@@ -1007,6 +1056,7 @@ namespace OpenRA.Mods.Common.Traits
 					try
 					{
 						var obs = observationSerializer.Serialize(world.WorldTick);
+						commander?.FillObservation(obs);
 						if (world.IsGameOver)
 						{
 							obs.Done = true;
@@ -1641,6 +1691,10 @@ namespace OpenRA.Mods.Common.Traits
 			if (!Game.IsHeadless)
 			{
 				Log.Write("rl-bridge", $"{reason} (GUI: keeping process alive)");
+				SessionDone.Set();
+				IsEnabled = false;
+				Sessions.TryRemove(episodeId, out _);
+				PlayerSessions.TryRemove(PlayerKey(episodeId, player?.InternalName ?? ""), out _);
 				return;
 			}
 
@@ -1665,40 +1719,37 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			}
 
-			var repo = FindRlRepo();
-			if (repo == null)
+			var sidecarExe = FindStandaloneSidecar();
+			string repo = null;
+			string python = null;
+
+			if (sidecarExe == null)
 			{
-				Log.Write("rl-bridge", "PPO sidecar: repo not found (set OPENRA_RL_ROOT to OpenRA-RL)");
-				return;
+				repo = FindRlRepo();
+				if (repo == null)
+				{
+					Log.Write("rl-bridge", "PPO sidecar: neither standalone sidecar nor Python repo found (set OPENRA_RL_ROOT or OPENRA_RL_SIDECAR)");
+					return;
+				}
+
+				python = Environment.GetEnvironmentVariable("OPENRA_RL_PYTHON");
+				if (string.IsNullOrEmpty(python))
+				{
+					var win = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+					var nix = Path.Combine(repo, ".venv", "bin", "python");
+					python = File.Exists(win) ? win : File.Exists(nix) ? nix : null;
+				}
+
+				if (string.IsNullOrEmpty(python) || !File.Exists(python))
+				{
+					Log.Write("rl-bridge", "PPO sidecar: python not found (set OPENRA_RL_PYTHON)");
+					return;
+				}
 			}
 
-			var python = Environment.GetEnvironmentVariable("OPENRA_RL_PYTHON");
-			if (string.IsNullOrEmpty(python))
-			{
-				var win = Path.Combine(repo, ".venv", "Scripts", "python.exe");
-				var nix = Path.Combine(repo, ".venv", "bin", "python");
-				python = File.Exists(win) ? win : File.Exists(nix) ? nix : null;
-			}
-
-			if (string.IsNullOrEmpty(python) || !File.Exists(python))
-			{
-				Log.Write("rl-bridge", "PPO sidecar: python not found (set OPENRA_RL_PYTHON)");
-				return;
-			}
-
-			var ckpt = Environment.GetEnvironmentVariable("OPENRA_RL_CKPT");
-			if (string.IsNullOrEmpty(ckpt))
-			{
-				var best = Path.Combine(repo, "rl", "ckpts", "best.pt");
-				var latest = Path.Combine(repo, "rl", "ckpts", "latest.pt");
-				ckpt = File.Exists(best) ? best : latest;
-			}
-
-			if (string.IsNullOrEmpty(ckpt) || !File.Exists(ckpt))
-			{
-				Log.Write("rl-bridge", $"PPO sidecar: checkpoint missing ({ckpt})");
-				return;
-			}
+			var ckpt = FindCheckpoint(repo);
+			if (string.IsNullOrEmpty(ckpt) || (!File.Exists(ckpt) && !Directory.Exists(ckpt)))
+				Log.Write("rl-bridge", $"PPO sidecar: checkpoint missing or not found ({ckpt ?? "none found"})");
 
 			try
 			{
@@ -1707,17 +1758,38 @@ namespace OpenRA.Mods.Common.Traits
 				// here too in case this binary is mixed with an older Game.dll.
 				Log.AddChannel("ppo-agent", "ppo-agent.log");
 
-				var psi = new ProcessStartInfo
+				ProcessStartInfo psi;
+				var slotArg = player != null && !string.IsNullOrEmpty(player.InternalName) ? $" --slot {player.InternalName}" : "";
+				var sessionArg = !string.IsNullOrEmpty(episodeId) ? $" --session {episodeId}" : "";
+				if (sidecarExe != null)
 				{
-					FileName = python,
-					Arguments = $"-m rl.play_skirmish --attach --port {port} --ckpt \"{ckpt}\"",
-					WorkingDirectory = repo,
-					UseShellExecute = false,
-					CreateNoWindow = true,
-					RedirectStandardOutput = true,
-					RedirectStandardError = true
-				};
-				psi.Environment["PYTHONPATH"] = repo;
+					psi = new ProcessStartInfo
+					{
+						FileName = sidecarExe,
+						Arguments = $"--attach --port {port}{slotArg}{sessionArg}" + (!string.IsNullOrEmpty(ckpt) ? $" --ckpt \"{ckpt}\"" : ""),
+						WorkingDirectory = Path.GetDirectoryName(sidecarExe),
+						UseShellExecute = false,
+						CreateNoWindow = true,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true
+					};
+				}
+				else
+				{
+					var module = File.Exists(Path.Combine(repo, "ra_rl", "play_skirmish.py")) ? "ra_rl.play_skirmish" : "rl.play_skirmish";
+					psi = new ProcessStartInfo
+					{
+						FileName = python,
+						Arguments = $"-m {module} --attach --port {port}{slotArg}{sessionArg}" + (!string.IsNullOrEmpty(ckpt) ? $" --ckpt \"{ckpt}\"" : ""),
+						WorkingDirectory = repo,
+						UseShellExecute = false,
+						CreateNoWindow = true,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true
+					};
+					psi.Environment["PYTHONPATH"] = repo;
+				}
+
 				psi.Environment["PYTHONUNBUFFERED"] = "1";
 				psi.Environment["OPENRA_RL_AUTOSTART"] = "0";
 
@@ -1740,7 +1812,7 @@ namespace OpenRA.Mods.Common.Traits
 				};
 				ppoSidecar.BeginOutputReadLine();
 				ppoSidecar.BeginErrorReadLine();
-				Log.Write("rl-bridge", $"PPO sidecar pid={ppoSidecar.Id} ckpt={ckpt}");
+				Log.Write("rl-bridge", $"PPO sidecar pid={ppoSidecar.Id} bin={psi.FileName} ckpt={ckpt}");
 			}
 			catch (Exception e)
 			{
@@ -1766,18 +1838,116 @@ namespace OpenRA.Mods.Common.Traits
 			}
 		}
 
-		static string FindRlRepo()
+		static string FindStandaloneSidecar()
 		{
-			var env = Environment.GetEnvironmentVariable("OPENRA_RL_ROOT");
-			if (!string.IsNullOrEmpty(env) && File.Exists(Path.Combine(env, "rl", "play_skirmish.py")))
+			var env = Environment.GetEnvironmentVariable("OPENRA_RL_SIDECAR");
+			if (!string.IsNullOrEmpty(env) && File.Exists(env))
 				return Path.GetFullPath(env);
 
 			var engine = Platform.EngineDir;
-			foreach (var cand in new[] { Path.Combine(engine, ".."), engine })
+			var candidates = new List<string>
 			{
-				var full = Path.GetFullPath(cand);
-				if (File.Exists(Path.Combine(full, "rl", "play_skirmish.py")))
-					return full;
+				Path.Combine(engine, "rl_agent", "rl_sidecar.exe"),
+				Path.Combine(engine, "rl_sidecar.exe"),
+				Path.Combine(engine, "..", "rl_agent", "rl_sidecar.exe"),
+			};
+
+			try
+			{
+				var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+				candidates.Add(Path.Combine(baseDir, "rl_agent", "rl_sidecar.exe"));
+				candidates.Add(Path.Combine(baseDir, "rl_sidecar.exe"));
+			}
+			catch { }
+
+			foreach (var cand in candidates)
+			{
+				try
+				{
+					if (File.Exists(cand))
+						return Path.GetFullPath(cand);
+				}
+				catch { }
+			}
+
+			return null;
+		}
+
+		static string FindCheckpoint(string repo)
+		{
+			var env = Environment.GetEnvironmentVariable("OPENRA_RL_CKPT");
+			if (!string.IsNullOrEmpty(env) && (File.Exists(env) || Directory.Exists(env)))
+				return Path.GetFullPath(env);
+
+			var engine = Platform.EngineDir;
+			var candidates = new List<string>
+			{
+				Path.Combine(engine, "onnx_models"),
+				Path.Combine(engine, "rl_agent", "onnx_models"),
+				Path.Combine(engine, "rl_agent", "checkpoint_best.pt"),
+				Path.Combine(engine, "rl_agent", "model.pt"),
+			};
+
+			try
+			{
+				var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+				candidates.Add(Path.Combine(baseDir, "onnx_models"));
+				candidates.Add(Path.Combine(baseDir, "rl_agent", "onnx_models"));
+				candidates.Add(Path.Combine(baseDir, "rl_agent", "checkpoint_best.pt"));
+				candidates.Add(Path.Combine(baseDir, "rl_agent", "model.pt"));
+			}
+			catch { }
+
+			if (!string.IsNullOrEmpty(repo))
+			{
+				candidates.Add(Path.Combine(repo, "onnx_models"));
+				candidates.Add(Path.Combine(repo, "runs", "v4", "selfplay", "checkpoint_best.pt"));
+				candidates.Add(Path.Combine(repo, "runs", "v4", "selfplay", "checkpoint_latest.pt"));
+				candidates.Add(Path.Combine(repo, "runs", "v4", "bc_v4", "model.pt"));
+				candidates.Add(Path.Combine(repo, "rl", "ckpts", "best.pt"));
+				candidates.Add(Path.Combine(repo, "rl", "ckpts", "latest.pt"));
+			}
+
+			foreach (var cand in candidates)
+			{
+				try
+				{
+					if (Directory.Exists(cand) && File.Exists(Path.Combine(cand, "commander_item.onnx")))
+						return Path.GetFullPath(cand);
+					if (File.Exists(cand))
+						return Path.GetFullPath(cand);
+				}
+				catch { }
+			}
+
+			return null;
+		}
+
+		static string FindRlRepo()
+		{
+			var env = Environment.GetEnvironmentVariable("OPENRA_RL_ROOT");
+			if (!string.IsNullOrEmpty(env) && (File.Exists(Path.Combine(env, "ra_rl", "play_skirmish.py")) || File.Exists(Path.Combine(env, "rl", "play_skirmish.py"))))
+				return Path.GetFullPath(env);
+
+			var engine = Platform.EngineDir;
+			var dirs = new List<string> { Path.Combine(engine, ".."), engine };
+			try
+			{
+				var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+				dirs.Add(baseDir);
+				dirs.Add(Path.Combine(baseDir, ".."));
+			}
+			catch { }
+
+			foreach (var cand in dirs)
+			{
+				try
+				{
+					var full = Path.GetFullPath(cand);
+					if (File.Exists(Path.Combine(full, "ra_rl", "play_skirmish.py")) || File.Exists(Path.Combine(full, "rl", "play_skirmish.py")))
+						return full;
+				}
+				catch { }
 			}
 
 			return null;
@@ -1905,6 +2075,7 @@ namespace OpenRA.Mods.Common.Traits
 			if (observationSerializer == null)
 				throw new InvalidOperationException($"Bridge {episodeId} not activated");
 			var obs = observationSerializer.Serialize(world.WorldTick);
+			commander?.FillObservation(obs);
 			obs.PlayerSlot = player?.InternalName ?? "";
 			if (world.IsGameOver)
 			{

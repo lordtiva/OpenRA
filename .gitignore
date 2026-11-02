@@ -50,3 +50,5 @@ update.log
 
 # IntelliJ files
 .idea
+
+publish_win64/
